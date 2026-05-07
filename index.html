@@ -1,0 +1,1743 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<script>
+!function(f,b,e,v,n,t,s){
+if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];
+s.parentNode.insertBefore(t,s)
+}(window, document,'script','https://connect.facebook.net/en_US/fbevents.js');
+
+function gerarId(){
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
+  let id = ''
+  for(let i = 0; i < 8; i++) id += chars.charAt(Math.floor(Math.random() * chars.length))
+  return id
+}
+function getUserId(){
+  let id = localStorage.getItem('user_id')
+  if(!id || id.length !== 8){ id = gerarId(); localStorage.setItem('user_id', id) }
+  return id
+}
+const userId = getUserId()
+
+fbq('init', '799819532599997', { external_id: userId })
+fbq('track', 'PageView', { external_id: userId })
+
+function enviarEvento(valor){
+  if(!valor) return
+  const nome = valor.replace(/[^a-zA-Z0-9]/g, "")
+  if(!nome) return
+  try { fbq('trackCustom', nome, { external_id: userId }) } catch {}
+}
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+<script>
+(async function(){
+
+const DEBUG = false
+
+const params = new URLSearchParams(window.location.search)
+
+const ENABLE_PARIDADE = (() => {
+  const urlParam = params.get("paridade")
+  if(urlParam !== null) return urlParam === "1"
+  return true
+})()
+
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycby_ejOA_7nbW9nVFwkPyJxTSXTMEnbP8Jn6ENMtHYyZm9Ua6eERRWOQeQ7EuD133YGq/exec"
+
+function timeout(promise, ms, fallback){
+  return Promise.race([promise, new Promise(res => setTimeout(() => res(fallback), ms))])
+}
+
+// =========================================================
+// PARAMS LINK + UC
+// =========================================================
+let LINK = null, UC = null
+const raw = params.get("dest")
+if(raw && raw.includes("|||")){
+  const p = raw.split("|||"); LINK = p[0]; UC = p[1]
+} else {
+  LINK = params.get("dest"); UC = params.get("uc")
+}
+if(!LINK || !UC) throw new Error("Parametros invalidos")
+
+// =========================================================
+// PLACEMENT + SOURCE
+// =========================================================
+const plRaw  = (params.get("pl")  || "").toLowerCase().trim()
+const srcRaw = (params.get("src") || "").toLowerCase().trim()
+
+function classPlacement(p){
+  if(!p || p.includes("{{")) return "PU"
+  const n = p.replace(/[_\s-]/g, "")
+  if(n.includes("profilereels"))  return "PP"
+  if(n.includes("reelsoverlay"))  return "PV"
+  if(n.includes("reels"))         return "PR"
+  if(n.includes("stories"))       return "PS"
+  if(n.includes("explorehome"))   return "PH"
+  if(n.includes("explore"))       return "PE"
+  if(n.includes("search"))        return "PQ"
+  if(n.includes("marketplace"))   return "PM"
+  if(n.includes("instream"))      return "PI"
+  if(n.includes("video"))         return "PI"
+  if(n.includes("messenger"))     return "PG"
+  if(n.includes("audience"))      return "PA"
+  if(n.includes("feed"))          return "PF"
+  return "PO"
+}
+function classSrc(s){
+  if(!s || s.includes("{{")) return "SU"
+  if(s === "ig")  return "SI"
+  if(s === "fb")  return "SF"
+  if(s === "msg") return "SM"
+  if(s === "an")  return "SA"
+  return "SU"
+}
+const placementTag = classPlacement(plRaw)
+const sourceTag    = classSrc(srcRaw)
+
+// =========================================================
+// GEOLOCALIZAÇÃO MULTI-FONTE + CACHE
+// =========================================================
+async function fetchGeoFromAPI(url) {
+  const resp = await fetch(url, { signal: AbortSignal.timeout(2000) })
+  if (!resp.ok) throw new Error("bad response")
+  return resp.json()
+}
+
+function extrairGeo(d) {
+  const rc = (d.region_code || "").replace(/[^A-Za-z]/g, "").toUpperCase()
+  const state = rc.length === 2 ? rc : "ZZ"
+  const cityRaw = (d.city || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z]/g, "")
+    .toUpperCase()
+  const city = cityRaw.slice(0, 6) || "ZZ"
+  return { state, city, city_full: d.city || "", state_full: d.region || "" }
+}
+
+const GEO_CACHE_KEY = "geo_cache"
+const GEO_CACHE_TTL = 30 * 60 * 1000 // 30 minutos
+
+async function medirGeo() {
+  // 1. Tentar cache válido
+  try {
+    const cached = JSON.parse(sessionStorage.getItem(GEO_CACHE_KEY))
+    if (cached && cached.expires > Date.now()) {
+      return cached.data
+    }
+  } catch {}
+
+  // 2. Lista de APIs em ordem de preferência
+  const apis = [
+    () => fetchGeoFromAPI("https://ipapi.co/json/"),
+    () => fetchGeoFromAPI("https://ipwho.is/"),
+    () => fetchGeoFromAPI("https://freeipapi.com/api/json")
+  ]
+
+  let data = null
+  for (const apiFn of apis) {
+    try {
+      const json = await apiFn()
+      data = extrairGeo(json)
+      if (data.state !== "ZZ" || data.city !== "ZZ") break // sucesso
+    } catch {}
+  }
+
+  // 3. Se todas falharam, tenta reutilizar cache expirado
+  if (!data) {
+    try {
+      const cached = JSON.parse(sessionStorage.getItem(GEO_CACHE_KEY))
+      if (cached && cached.data) {
+        data = cached.data
+      }
+    } catch {}
+  }
+
+  // 4. Fallback final
+  if (!data) {
+    data = { state: "ZZ", city: "ZZ", city_full: "", state_full: "" }
+  }
+
+  // 5. Atualiza cache (mesmo que seja ZZ, para evitar requisições repetidas imediatas)
+  try {
+    sessionStorage.setItem(GEO_CACHE_KEY, JSON.stringify({
+      data,
+      expires: Date.now() + GEO_CACHE_TTL
+    }))
+  } catch {}
+
+  return data
+}
+
+// =========================================================
+// DIVISÃO DA HORA (mantida para eventos, mas NÃO na UC)
+// =========================================================
+const HP_PADRAO = 20
+const hp = HP_PADRAO
+
+const baseUC   = UC.replace(/[^a-zA-Z0-9]/g, "").slice(0, 16)
+const tempoTag = "T1"   // só usado nos eventos, não na UC
+
+// =========================================================
+// VELOCIDADE
+// =========================================================
+function classificarVel(mbps){
+  if(mbps <= 0.5) return 1
+  if(mbps <= 1)   return 3
+  if(mbps <= 5)   return 6
+  if(mbps <= 10)  return 8
+  if(mbps <= 20)  return 10
+  return 14
+}
+async function medirVelocidade(){
+  try { return "N" + classificarVel(navigator.connection?.downlink || 5) }
+  catch { return "N6" }
+}
+
+// =========================================================
+// BATERIA
+// =========================================================
+async function medirBateria(){
+  try {
+    const bat = await navigator.getBattery()
+    const pct  = Math.round(bat.level * 10)
+    return { bateria: pct < 2 ? "BL" : "B" + pct, carregando: bat.charging ? "C1" : "C0" }
+  } catch { return { bateria: "", carregando: "" } }
+}
+
+// =========================================================
+// MOVIMENTO
+// =========================================================
+function medirMovimento(){
+  return new Promise(resolve => {
+    let det = false
+    function h(e){
+      const a = e.accelerationIncludingGravity
+      if(!a) return
+      if(Math.abs(a.x||0)+Math.abs(a.y||0)+Math.abs(a.z||0) > 15) det = true
+    }
+    if(typeof DeviceMotionEvent !== "undefined"){
+      window.addEventListener("devicemotion", h)
+      setTimeout(() => { window.removeEventListener("devicemotion", h); resolve(det?"M1":"M0") }, 120)
+    } else resolve("M0")
+  })
+}
+
+// =========================================================
+// RAM
+// =========================================================
+function medirRAM(){
+  const ram = navigator.deviceMemory || 4
+  if(ram <= 2) return "R1"
+  if(ram <= 4) return "R2"
+  if(ram <= 8) return "R3"
+  return "R4"
+}
+
+// =========================================================
+// WEBRTC
+// =========================================================
+function medirWebRTC(){
+  return new Promise(resolve => {
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [] })
+      const ips = new Set(); let enc = false
+      function encerrar(){
+        if(enc) return; enc = true; try{pc.close()}catch{}
+        let tag = "RU"
+        for(const ip of [...ips]){
+          if(/^10\./.test(ip))                           { tag="RC"; break }
+          if(/^172\.(1[6-9]|2\d|3[01])\./.test(ip))     { tag="RV"; break }
+          if(/^192\.168\./.test(ip))                       tag="RH"
+        }
+        resolve(tag)
+      }
+      pc.onicecandidate = e => {
+        if(!e||!e.candidate){ encerrar(); return }
+        const m = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/)
+        if(m) ips.add(m[1])
+      }
+      pc.createDataChannel('')
+      pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>resolve("RU"))
+      setTimeout(()=>encerrar(), 850)
+    } catch { resolve("RU") }
+  })
+}
+
+function getCookie(name){
+  const m = document.cookie.match(new RegExp('(^| )'+name+'=([^;]+)'))
+  return m ? m[2] : ""
+}
+
+// =========================================================
+// SINCRONO
+// =========================================================
+const tema   = window.matchMedia('(prefers-color-scheme: dark)').matches ? "D" : "L"
+const ua     = navigator.userAgent || ""
+const device = /android/i.test(ua) ? "A" : /iphone|ipad|ipod/i.test(ua) ? "I" : "O"
+const vib    = navigator.vibrate ? "V1" : "V0"   // usado nos eventos, não na UC
+const conexao = (() => {
+  const c = navigator.connection
+  if(!c) return "U"
+  if(c.type==="wifi") return "W"
+  if(c.type==="cellular") return "M"
+  return "U"
+})()
+
+// =========================================================
+// PARALELO — inclui geo com os outros sensores
+// =========================================================
+const [velTag, batObj, movimento, redeTag, geo] = await Promise.all([
+  timeout(medirVelocidade(), 200,  "N6"),
+  timeout(medirBateria(),    200,  { bateria:"", carregando:"" }),
+  timeout(medirMovimento(),  200,  "M0"),
+  timeout(medirWebRTC(),     950,  "RU"),
+  timeout(medirGeo(),        2500, { state:"ZZ", city:"ZZ", city_full:"", state_full:"" }) // tempo maior para fallbacks
+])
+const ram = medirRAM()
+
+// Estado e cidade via IP
+const stateTag = geo.state  // ex: SP, RJ, SC, ZZ
+const cityTag  = geo.city   // ex: SA, RI, BE, ZZ (2 chars)
+
+// =========================================================
+// TEMPORAIS
+// =========================================================
+let paridadeTag = null
+if(ENABLE_PARIDADE){
+  const agora = new Date()
+  paridadeTag = agora.getMinutes() % 2 === 0 ? "Par" : "Impar"
+}
+
+const agoraData  = new Date()
+const hora       = agoraData.getHours()
+const minuto     = agoraData.getMinutes()
+const segundo    = agoraData.getSeconds()
+const dia        = agoraData.getDate()
+const diaSemana  = ["Domingo","Segunda","Terca","Quarta","Quinta","Sexta","Sabado"][agoraData.getDay()]
+
+const minDezena  = Math.floor(minuto/10) % 2 === 0 ? "Par" : "Impar"
+const minUnidade = (minuto%10) % 2 === 0 ? "Par" : "Impar"
+const segMetade  = segundo <= 30 ? "Seg0030" : "Seg3160"
+const horaPar    = hora % 2 === 0 ? "Par" : "Impar"
+const diaPar     = dia  % 2 === 0 ? "Par" : "Impar"
+
+let periodo = "Noite"
+if(hora >= 6  && hora <= 11) periodo = "Manha"
+else if(hora >= 12 && hora <= 17) periodo = "Tarde"
+
+const bNum = parseInt((batObj.bateria.match(/\d+/)||[0])[0])
+const bPar = isNaN(bNum) ? null : (bNum%2===0?"Par":"Impar")
+const nNum = parseInt((velTag.match(/\d+/)||[0])[0])
+const nPar = isNaN(nNum) ? null : (nNum%2===0?"Par":"Impar")
+
+const FBP = (getCookie("_fbp") !== "") ? 1 : 0
+const FBC = (getCookie("_fbc") !== "") ? 1 : 0
+
+let horaTag
+if(hp===1){
+  horaTag = "H" + String(hora).padStart(2,"0")
+} else {
+  const bucket = Math.min(Math.floor(minuto*hp/60), hp-1)
+  horaTag = "H" + String(hora).padStart(2,"0") + "M" + bucket
+}
+
+const browserTag = /EX(?=ID)/i.test(UC) ? "EX" : /IX(?=ID)/i.test(UC) ? "IX" : "Outros"
+
+// =========================================================
+// EVENTOS META — dispara sinais individuais
+// =========================================================
+const eventosBasicos = [
+  tempoTag, velTag, batObj.bateria, batObj.carregando,
+  tema, ram, vib, device, conexao, movimento, redeTag,
+  placementTag, sourceTag,
+  stateTag, cityTag,
+  minDezena, minUnidade, segMetade, horaPar,
+  diaSemana, diaPar, periodo,
+  (bPar!==null?bPar:""), (nPar!==null?nPar:""),
+  "FBP"+FBP, "FBC"+FBC
+]
+if(ENABLE_PARIDADE && paridadeTag) eventosBasicos.push(paridadeTag)
+eventosBasicos.forEach(enviarEvento)
+enviarEvento(horaTag)
+
+// =========================================================
+// RUNTIME MAP — todas as variáveis para as regras TOP
+// =========================================================
+const RUNTIME = {
+  T          : tempoTag,
+  N          : velTag,
+  B          : batObj.bateria    || "B_absent",
+  C          : batObj.carregando || "C_absent",
+  Tema       : tema,
+  RAM        : ram,
+  V          : vib,
+  Device     : device,
+  Conexao    : conexao,
+  Movimento  : movimento,
+  Rede       : redeTag,
+  Placement  : placementTag,
+  Source     : sourceTag,
+  Browser    : browserTag,
+  Hora       : horaTag,
+  State      : stateTag,
+  City       : cityTag,
+  Min_Dezena : minDezena,
+  Min_Unidade: minUnidade,
+  Seg_Metade : segMetade,
+  Hora_Par   : horaPar,
+  DiaSemana  : diaSemana,
+  Dia_Par    : diaPar,
+  Periodo    : periodo,
+  B_Par      : bPar,
+  N_Par      : nPar,
+  FBP        : FBP,
+  FBC        : FBC
+}
+if(ENABLE_PARIDADE && paridadeTag) RUNTIME.Paridade = paridadeTag
+
+// =========================================================
+// REGRAS TOP
+// =========================================================
+const REGRAS_TOP02 = []
+const REGRAS_TOP03 = []
+const REGRAS_TOP04 = [
+
+
+  { Hora: "H12M2", DiaSemana: "Sexta", Paridade: "Ímpar" },
+  { B: "B_absent", Hora: "H12M2", Paridade: "Ímpar" },
+  { B: "B_absent", Hora: "H12M2", Seg_Metade: "Seg_00_30" },
+  { Hora: "H12M2", Periodo: "Tarde", Paridade: "Ímpar" },
+  { B: "B_absent", C: "C_absent", Hora: "H12M2" },
+  { T: "T1", Placement: "PU", Hora: "H11M5" },
+  { B: "B3", Hora: "H22M6", Seg_Metade: "Seg_00_30" },
+  { Tema: "D", Hora: "H13M18", Dia_Par: "Ímpar" },
+  { RAM: "R3", Hora: "H20M4", DiaSemana: "Quarta" },
+  { N: "N6", Tema: "D", Hora: "H08M13" },
+  { B: "B8", RAM: "R3", Hora: "H22M1" },
+  { B: "B6", RAM: "R3", Hora: "H19M17" },
+  { B: "B4", Conexao: "W", Hora: "H10M8" },
+  { B: "BL", Movimento: "M0", Hora: "H13M18" },
+  { B: "B_absent", Hora: "H09M10", Paridade: "Ímpar" },
+  { C: "C0", Conexao: "M", Hora: "H18M16" },
+  { Tema: "D", RAM: "R2", Hora: "H01M1" },
+  { Tema: "L", Movimento: "M1", Hora: "H21M13" },
+  { Tema: "D", Rede: "RC", Hora: "H23M5" },
+  { Conexao: "M", Rede: "RC", Hora: "H09M8" },
+  { Conexao: "M", Hora: "H09M17", Paridade: "Par" },
+  { B: "B8", C: "C0", Hora: "H08M14" },
+  { B: "B4", RAM: "R3", Hora: "H23M16" },
+  { B: "B9", Rede: "RH", Hora: "H21M18" },
+  { B: "B_absent", Hora: "H07M12", DiaSemana: "Quarta" },
+  { B: "B_absent", Hora: "H13M18", DiaSemana: "Terça" },
+  { RAM: "R2", Hora: "H19M13", DiaSemana: "Segunda" },
+  { Placement: "PS", Hora: "H14M3", Dia_Par: "Ímpar" },
+  { Source: "SI", Hora: "H10M3", DiaSemana: "Sexta" },
+  { Hora: "H17M4", DiaSemana: "Domingo", Dia_Par: "Ímpar" },
+  { Hora: "H16M9", DiaSemana: "Domingo", Dia_Par: "Par" },
+  { Hora: "H18M10", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { T: "T1", Tema: "L", Hora: "H02M12" },
+  { B: "B_absent", RAM: "R3", Hora: "H21M13" },
+  { B: "B5", Source: "SI", Hora: "H19M18" },
+  { Placement: "PR", Hora: "H20M12", Paridade: "Par" },
+  { Hora: "H22M14", DiaSemana: "Segunda", Seg_Metade: "Seg_31_60" },
+  { B: "B_absent", Placement: "PF", Hora: "H09M10" },
+  { N: "N6", Tema: "D", Hora: "H00M10" },
+  { N: "N6", Hora: "H08M0", Seg_Metade: "Seg_00_30" },
+  { B: "B6", Tema: "D", Hora: "H18M7" },
+  { Tema: "L", Conexao: "W", Hora: "H01M12" },
+  { Placement: "PS", Hora: "H08M8", DiaSemana: "Sexta" },
+  { Hora: "H08M0", DiaSemana: "Quinta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H23M8", DiaSemana: "Terça", Seg_Metade: "Seg_31_60" },
+  { Tema: "D", Hora: "H13M18", Paridade: "Ímpar" },
+  { Tema: "D", RAM: "R2", Hora: "H08M13" },
+  { N: "N6", Hora: "H21M8", DiaSemana: "Terça" },
+  { B: "B_absent", Tema: "L", Hora: "H00M2" },
+  { B: "B5", Source: "SI", Hora: "H21M14" },
+  { B: "B_absent", Hora: "H16M19", Paridade: "Par" },
+  { Tema: "D", Hora: "H07M12", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H00M10", Paridade: "Ímpar" },
+  { V: "V0", Hora: "H23M19", Seg_Metade: "Seg_00_30" },
+  { V: "V0", Hora: "H12M14", Seg_Metade: "Seg_00_30" },
+  { V: "V0", Hora: "H07M17", Seg_Metade: "Seg_31_60" },
+  { Conexao: "M", Placement: "PS", Hora: "H12M5" },
+  { Source: "SI", Hora: "H01M12", Paridade: "Ímpar" },
+  { T: "T1", B: "B5", Hora: "H12M16" },
+  { T: "T1", B: "B7", Hora: "H12M5" },
+  { T: "T1", B: "B8", Hora: "H17M4" },
+  { T: "T1", B: "B6", Hora: "H17M12" },
+  { T: "T1", B: "B4", Hora: "H16M3" },
+  { T: "T1", Conexao: "M", Hora: "H05M11" },
+  { T: "T1", Hora: "H19M14", DiaSemana: "Sábado" },
+  { T: "T1", Hora: "H16M3", DiaSemana: "Sábado" },
+  { N: "N6", B: "B2", Tema: "L" },
+  { N: "N8", B: "B4", Hora: "H12M11" },
+  { N: "N8", B: "B6", Hora: "H14M10" },
+  { N: "N8", Rede: "RU", Hora: "H07M15" },
+  { N: "N6", Hora: "H22M14", DiaSemana: "Quinta" },
+  { N: "N6", Hora: "H20M16", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H17M3", Dia_Par: "Ímpar" },
+  { N: "N6", Hora: "H05M9", Paridade: "Ímpar" },
+  { N: "N6", Hora: "H08M18", Seg_Metade: "Seg_31_60" },
+  { N: "N7", Periodo: "Manhã", Hora_Par: "Ímpar" },
+  { B: "B8", C: "C0", Hora: "H14M4" },
+  { B: "B4", C: "C0", Hora: "H10M18" },
+  { B: "B6", Tema: "L", Hora: "H18M10" },
+  { B: "B4", Tema: "L", Hora: "H13M18" },
+  { B: "B8", Tema: "L", Hora: "H09M9" },
+  { B: "B_absent", Tema: "D", Hora: "H06M11" },
+  { B: "B3", Tema: "D", Hora: "H10M10" },
+  { B: "B7", RAM: "R2", Hora: "H20M10" },
+  { B: "B5", RAM: "R3", Hora: "H16M12" },
+  { B: "B6", RAM: "R2", Hora: "H11M4" },
+  { B: "B4", RAM: "R3", Hora: "H08M9" },
+  { B: "B_absent", RAM: "R3", Hora: "H10M8" },
+  { B: "B8", RAM: "R3", Hora: "H09M17" },
+  { B: "B10", RAM: "R2", Hora: "H09M12" },
+  { B: "B5", Conexao: "W", Hora: "H12M1" },
+  { B: "B10", Conexao: "W", Hora: "H09M9" },
+  { B: "B10", Conexao: "W", Hora: "H09M0" },
+  { B: "B10", Rede: "RH", Hora: "H18M14" },
+  { B: "B6", Rede: "RH", Hora: "H11M5" },
+  { B: "B3", Placement: "PS", Hora: "H21M5" },
+  { B: "B8", Placement: "PF", Hora: "H10M2" },
+  { B: "B10", Placement: "PS", Hora: "H21M11" },
+  { B: "B7", Placement: "PS", Hora: "H11M17" },
+  { B: "B3", Source: "SI", Hora: "H22M19" },
+  { B: "B2", Source: "SI", Hora: "H21M6" },
+  { B: "B2", Source: "SI", Hora: "H20M17" },
+  { B: "B_absent", Hora: "H22M13", DiaSemana: "Sexta" },
+  { B: "B_absent", Hora: "H15M17", DiaSemana: "Sexta" },
+  { B: "BL", Hora: "H20M15", Dia_Par: "Par" },
+  { B: "B3", Hora: "H08M15", Dia_Par: "Par" },
+  { B: "B3", Hora: "H20M15", Dia_Par: "Ímpar" },
+  { B: "B5", Hora: "H18M15", Dia_Par: "Ímpar" },
+  { B: "B_absent", Hora: "H01M17", Paridade: "Ímpar" },
+  { B: "B_absent", Hora: "H02M10", Paridade: "Par" },
+  { B: "B7", Hora: "H16M3", Min_Dezena: "Ímpar" },
+  { B: "B10", Hora: "H22M2", Seg_Metade: "Seg_31_60" },
+  { B: "B4", Hora: "H21M11", Seg_Metade: "Seg_31_60" },
+  { B: "B7", Hora: "H18M1", Seg_Metade: "Seg_00_30" },
+  { C: "C1", Tema: "L", Hora: "H22M6" },
+  { C: "C0", Conexao: "M", Hora: "H07M5" },
+  { C: "C0", Movimento: "M1", Hora: "H10M8" },
+  { C: "C0", Rede: "RU", Hora: "H15M6" },
+  { C: "C0", Placement: "PR", Hora: "H18M15" },
+  { C: "C0", Placement: "PR", Hora: "H14M16" },
+  { C: "C0", Hora: "H07M13", DiaSemana: "Sábado" },
+  { C: "C1", Hora: "H09M9", Paridade: "Ímpar" },
+  { C: "C1", Hora: "H21M18", Seg_Metade: "Seg_00_30" },
+  { Tema: "L", Conexao: "M", Hora: "H16M16" },
+  { Tema: "D", Conexao: "M", Hora: "H19M15" },
+  { Tema: "D", Conexao: "M", Hora: "H09M14" },
+  { Tema: "L", Conexao: "M", Hora: "H17M8" },
+  { Tema: "D", Conexao: "M", Hora: "H07M9" },
+  { Tema: "L", Rede: "RC", Hora: "H18M0" },
+  { Tema: "D", Placement: "PS", Hora: "H07M5" },
+  { Tema: "D", Placement: "PF", Hora: "H00M10" },
+  { Tema: "D", Hora: "H09M6", DiaSemana: "Quinta" },
+  { Tema: "L", Hora: "H16M8", DiaSemana: "Segunda" },
+  { Tema: "D", Hora: "H11M1", DiaSemana: "Domingo" },
+  { Tema: "L", Hora: "H20M10", DiaSemana: "Sábado" },
+  { Tema: "D", Hora: "H15M3", Dia_Par: "Ímpar" },
+  { RAM: "R2", Source: "SI", Hora: "H05M7" },
+  { RAM: "R2", Hora: "H12M14", DiaSemana: "Sexta" },
+  { RAM: "R2", Hora: "H16M1", DiaSemana: "Quinta" },
+  { RAM: "R2", Hora: "H00M2", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H10M19", DiaSemana: "Quarta" },
+  { RAM: "R3", Hora: "H19M15", DiaSemana: "Sábado" },
+  { RAM: "R2", Hora: "H05M17", Dia_Par: "Ímpar" },
+  { Conexao: "M", Placement: "PS", Hora: "H20M7" },
+  { Conexao: "M", Placement: "PS", Hora: "H13M9" },
+  { Conexao: "M", Hora: "H19M14", Dia_Par: "Ímpar" },
+  { Movimento: "M0", Hora: "H08M14", DiaSemana: "Terça" },
+  { Movimento: "M0", Hora: "H14M2", DiaSemana: "Sábado" },
+  { Rede: "RC", Placement: "PF", Hora: "H08M8" },
+  { Rede: "RH", Placement: "PR", Hora: "H17M10" },
+  { Rede: "RC", Placement: "PF", Hora: "H14M15" },
+  { Rede: "RC", Placement: "PS", Hora: "H12M3" },
+  { Rede: "RU", Source: "SI", Hora: "H07M5" },
+  { Rede: "RC", Hora: "H18M1", DiaSemana: "Terça" },
+  { Rede: "RC", Hora: "H11M4", Dia_Par: "Ímpar" },
+  { Rede: "RU", Hora: "H18M16", Paridade: "Ímpar" },
+  { Rede: "RC", Hora: "H15M17", Seg_Metade: "Seg_00_30" },
+  { Placement: "PR", Source: "SI", Hora: "H07M16" },
+  { Placement: "PR", Source: "SI", Hora: "H17M10" },
+  { Placement: "PF", Hora: "H21M16", DiaSemana: "Quinta" },
+  { Placement: "PF", Hora: "H09M6", DiaSemana: "Quinta" },
+  { Placement: "PS", Hora: "H10M14", DiaSemana: "Quarta" },
+  { Placement: "PS", Hora: "H22M19", DiaSemana: "Segunda" },
+  { Placement: "PF", Hora: "H22M7", DiaSemana: "Domingo" },
+  { Placement: "PR", Hora: "H16M7", Seg_Metade: "Seg_00_30" },
+  { Source: "SI", Hora: "H09M10", DiaSemana: "Terça" },
+  { Hora: "H16M1", DiaSemana: "Terça", Dia_Par: "Ímpar" },
+  { Hora: "H15M17", DiaSemana: "Segunda", Dia_Par: "Par" },
+  { Hora: "H18M15", DiaSemana: "Segunda", Dia_Par: "Ímpar" },
+  { Hora: "H13M17", DiaSemana: "Terça", Periodo: "Tarde" },
+  { Hora: "H11M8", DiaSemana: "Sexta", Paridade: "Ímpar" },
+  { Hora: "H11M12", DiaSemana: "Quarta", Paridade: "Ímpar" },
+  { Hora: "H18M16", DiaSemana: "Segunda", Min_Dezena: "Par" },
+  { Hora: "H19M7", DiaSemana: "Terça", Seg_Metade: "Seg_31_60" },
+  { Hora: "H12M15", DiaSemana: "Segunda", Seg_Metade: "Seg_00_30" },
+  { Hora: "H12M7", DiaSemana: "Sábado", Seg_Metade: "Seg_00_30" },
+  { B: "B_absent", Placement: "PF", Hora: "H08M13" },
+  { N: "N6", Hora: "H08M13", Dia_Par: "Par" },
+  { N: "N6", Hora: "H13M18", Dia_Par: "Ímpar" },
+  { B: "B4", Tema: "L", Hora: "H23M16" },
+  { B: "B_absent", Conexao: "W", Hora: "H19M2" },
+  { B: "B8", Source: "SI", Hora: "H10M2" },
+  { B: "B_absent", Hora: "H11M12", DiaSemana: "Quarta" },
+  { Tema: "D", Conexao: "M", Hora: "H18M7" },
+  { Tema: "L", Hora: "H08M10", DiaSemana: "Quinta" },
+  { Tema: "L", Hora: "H14M11", DiaSemana: "Domingo" },
+  { RAM: "R3", Conexao: "M", Hora: "H10M8" },
+  { Hora: "H16M18", DiaSemana: "Sexta", Paridade: "Par" },
+  { T: "T1", B: "B4", Hora: "H22M19" },
+  { T: "T1", B: "B4", Hora: "H00M10" },
+  { T: "T1", Placement: "PU", Hora: "H09M8" },
+  { T: "T1", Hora: "H00M4", DiaSemana: "Terça" },
+  { T: "T1", Hora: "H13M19", DiaSemana: "Sábado" },
+  { N: "N8", Rede: "RU", Hora: "H11M3" },
+  { N: "N6", Hora: "H11M15", DiaSemana: "Sexta" },
+  { N: "N6", Hora: "H19M8", DiaSemana: "Quinta" },
+  { N: "N6", Hora: "H17M17", DiaSemana: "Terça" },
+  { N: "N8", Hora: "H06M13", DiaSemana: "Sábado" },
+  { N: "N6", Hora: "H13M7", Paridade: "Par" },
+  { N: "N6", Hora: "H14M11", Seg_Metade: "Seg_31_60" },
+  { B: "B5", Tema: "L", Hora: "H23M2" },
+  { B: "B3", Tema: "L", Hora: "H13M19" },
+  { B: "B7", RAM: "R3", Hora: "H19M11" },
+  { B: "B6", RAM: "R2", Hora: "H12M5" },
+  { B: "B9", Conexao: "W", Hora: "H11M6" },
+  { B: "B9", Placement: "PS", Hora: "H11M12" },
+  { B: "B2", Placement: "PS", Hora: "H21M19" },
+  { B: "B6", Source: "SI", Hora: "H10M16" },
+  { B: "B5", Source: "SI", Hora: "H10M14" },
+  { B: "B8", Source: "SI", Hora: "H09M7" },
+  { B: "B_absent", Hora: "H10M11", DiaSemana: "Sábado" },
+  { B: "B5", Hora: "H12M14", Dia_Par: "Ímpar" },
+  { B: "B7", Hora: "H20M1", Paridade: "Ímpar" },
+  { B: "B7", Hora: "H14M9", Paridade: "Ímpar" },
+  { B: "B8", Hora: "H08M16", Min_Dezena: "Par" },
+  { B: "B9", Hora: "H14M15", Seg_Metade: "Seg_31_60" },
+  { B: "B6", Hora: "H12M9", Seg_Metade: "Seg_00_30" },
+  { B: "B6", Hora: "H19M0", Seg_Metade: "Seg_00_30" },
+  { C: "C0", Placement: "PS", Hora: "H06M13" },
+  { C: "C0", Hora: "H16M12", DiaSemana: "Sexta" },
+  { Tema: "D", Conexao: "M", Hora: "H13M8" },
+  { Tema: "D", Rede: "RU", Hora: "H06M19" },
+  { Tema: "D", Hora: "H21M19", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H22M19", DiaSemana: "Terça" },
+  { Tema: "D", Hora: "H22M10", DiaSemana: "Domingo" },
+  { Tema: "L", Hora: "H09M9", DiaSemana: "Domingo" },
+  { Tema: "L", Hora: "H01M17", Seg_Metade: "Seg_31_60" },
+  { RAM: "R2", Rede: "RC", Hora: "H21M14" },
+  { RAM: "R3", Placement: "PE", Seg_Metade: "Seg_00_30" },
+  { RAM: "R2", Hora: "H20M15", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H07M14", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H00M1", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H11M11", DiaSemana: "Sábado" },
+  { Conexao: "M", Hora: "H23M17", Dia_Par: "Par" },
+  { Movimento: "M0", Hora: "H16M9", DiaSemana: "Quinta" },
+  { Rede: "RH", Hora: "H08M8", DiaSemana: "Sábado" },
+  { Rede: "RC", Hora: "H15M5", Seg_Metade: "Seg_00_30" },
+  { Placement: "PF", Hora: "H10M17", DiaSemana: "Terça" },
+  { Placement: "PF", Hora: "H10M4", DiaSemana: "Terça" },
+  { Placement: "PF", Hora: "H05M16", Dia_Par: "Par" },
+  { Placement: "PS", Hora: "H01M3", Dia_Par: "Ímpar" },
+  { Placement: "PR", Hora: "H11M1", Seg_Metade: "Seg_31_60" },
+  { Source: "SI", Hora: "H13M9", DiaSemana: "Terça" },
+  { Hora: "H19M2", DiaSemana: "Domingo", Dia_Par: "Ímpar" },
+  { Hora: "H22M14", DiaSemana: "Sexta", Paridade: "Ímpar" },
+  { Hora: "H00M0", DiaSemana: "Quinta", Paridade: "Par" },
+  { Hora: "H11M5", DiaSemana: "Quarta", Paridade: "Par" },
+  { Hora: "H20M7", DiaSemana: "Terça", Paridade: "Par" },
+  { Hora: "H11M7", DiaSemana: "Sábado", Paridade: "Par" },
+  { Hora: "H11M6", DiaSemana: "Quarta", Min_Dezena: "Par" },
+  { Hora: "H21M4", DiaSemana: "Sexta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H14M10", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H15M14", DiaSemana: "Domingo", Seg_Metade: "Seg_31_60" },
+  { RAM: "R2", Hora: "H08M8", Paridade: "Ímpar" },
+  { N: "N6", Hora: "H22M18", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H11M6", DiaSemana: "Quarta" },
+  { B: "B_absent", Hora: "H10M2", DiaSemana: "Quarta" },
+  { C: "C0", Placement: "PF", Hora: "H19M14" },
+  { RAM: "R3", Hora: "H07M2", Dia_Par: "Ímpar" },
+  { Placement: "PS", Hora: "H07M12", DiaSemana: "Quarta" },
+  { Hora: "H08M9", DiaSemana: "Sábado", Paridade: "Ímpar" },
+  { RAM: "R2", Hora: "H11M12", DiaSemana: "Quarta" },
+  { Rede: "RU", Hora: "H10M14", DiaSemana: "Quinta" },
+  { Rede: "RH", Hora: "H10M8", DiaSemana: "Quinta" },
+  { T: "T1", Source: "SU", Hora: "H21M8" },
+  { N: "N6", Tema: "D", Hora: "H19M8" },
+  { N: "N6", Tema: "D", Hora: "H10M11" },
+  { N: "N6", Placement: "PS", Hora: "H10M11" },
+  { N: "N6", Placement: "PF", Hora: "H16M14" },
+  { N: "N6", Hora: "H11M7", DiaSemana: "Sexta" },
+  { N: "N8", Hora: "H16M19", DiaSemana: "Quinta" },
+  { N: "N6", Hora: "H18M2", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H08M11", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H19M8", DiaSemana: "Terça" },
+  { N: "N6", Hora: "H15M3", Dia_Par: "Ímpar" },
+  { N: "N6", Hora: "H06M19", Paridade: "Ímpar" },
+  { B: "B5", Tema: "L", Hora: "H20M5" },
+  { B: "B_absent", Tema: "D", Hora: "H19M8" },
+  { B: "B5", RAM: "R3", Hora: "H21M7" },
+  { B: "B8", RAM: "R3", Hora: "H19M19" },
+  { B: "B4", Conexao: "W", Hora: "H11M16" },
+  { B: "B5", Conexao: "W", Hora: "H17M8" },
+  { B: "B_absent", Rede: "RC", Hora: "H13M9" },
+  { B: "B_absent", Hora: "H13M0", DiaSemana: "Quarta" },
+  { B: "B7", Hora: "H13M13", Dia_Par: "Ímpar" },
+  { B: "B9", Hora: "H10M0", Paridade: "Par" },
+  { B: "B4", Hora: "H21M16", Min_Dezena: "Ímpar" },
+  { B: "B9", Hora: "H10M4", Seg_Metade: "Seg_31_60" },
+  { B: "B_absent", Hora: "H05M17", Seg_Metade: "Seg_00_30" },
+  { B: "B5", Hora: "H22M11", Seg_Metade: "Seg_31_60" },
+  { C: "C0", Rede: "RU", Hora: "H13M16" },
+  { Tema: "D", Rede: "RU", Hora: "H00M9" },
+  { Tema: "L", Hora: "H06M0", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H20M12", DiaSemana: "Segunda" },
+  { Tema: "L", Hora: "H17M13", DiaSemana: "Domingo" },
+  { Tema: "D", Hora: "H23M19", DiaSemana: "Sábado" },
+  { Tema: "D", Hora: "H02M1", Dia_Par: "Ímpar" },
+  { RAM: "R3", Placement: "PF", Hora: "H08M15" },
+  { RAM: "R3", Hora: "H09M10", DiaSemana: "Segunda" },
+  { RAM: "R2", Hora: "H22M10", DiaSemana: "Domingo" },
+  { V: "V0", Hora: "H11M8", Paridade: "Ímpar" },
+  { Conexao: "M", Placement: "PF", Hora: "H14M10" },
+  { Conexao: "M", Placement: "PF", Hora: "H11M8" },
+  { Conexao: "W", Hora: "H19M18", DiaSemana: "Segunda" },
+  { Conexao: "M", Hora: "H12M8", Dia_Par: "Ímpar" },
+  { Movimento: "M0", Rede: "RC", Hora: "H22M19" },
+  { Movimento: "M0", Hora: "H12M9", DiaSemana: "Segunda" },
+  { Movimento: "M0", Hora: "H13M10", DiaSemana: "Sábado" },
+  { Rede: "RU", Placement: "PS", Hora: "H11M3" },
+  { Rede: "RC", Hora: "H21M17", Dia_Par: "Par" },
+  { Rede: "RC", Hora: "H09M11", Dia_Par: "Ímpar" },
+  { Rede: "RU", Hora: "H23M17", Paridade: "Par" },
+  { Rede: "RC", Hora: "H22M4", Seg_Metade: "Seg_00_30" },
+  { Placement: "PR", Hora: "H16M9", Dia_Par: "Par" },
+  { Placement: "PS", Hora: "H13M7", Paridade: "Par" },
+  { Source: "SI", Hora: "H16M0", DiaSemana: "Domingo" },
+  { Source: "SI", Hora: "H09M17", DiaSemana: "Segunda" },
+  { Source: "SI", Hora: "H00M5", DiaSemana: "Domingo" },
+  { Hora: "H12M0", DiaSemana: "Terça", Dia_Par: "Ímpar" },
+  { Hora: "H13M12", DiaSemana: "Segunda", Dia_Par: "Par" },
+  { Hora: "H13M6", DiaSemana: "Quarta", Min_Dezena: "Par" },
+  { Hora: "H23M8", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H16M3", DiaSemana: "Sexta", Seg_Metade: "Seg_31_60" },
+  { RAM: "R2", Hora: "H16M1", Dia_Par: "Ímpar" },
+  { RAM: "R3", Placement: "PF", Hora: "H19M14" },
+  { Tema: "L", Hora: "H13M1", DiaSemana: "Quinta" },
+  { RAM: "R2", Placement: "PS", Hora: "H07M5" },
+  { T: "T1", B: "B7", Hora: "H22M19" },
+  { N: "N6", Placement: "PS", Hora: "H08M11" },
+  { N: "N6", Placement: "PF", Hora: "H00M5" },
+  { N: "N6", Hora: "H23M7", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H13M3", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H12M15", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H21M19", Paridade: "Par" },
+  { N: "N6", Hora: "H12M9", Paridade: "Par" },
+  { N: "N8", Hora: "H04M6", Paridade: "Par" },
+  { B: "B5", RAM: "R3", Hora: "H21M8" },
+  { B: "B7", Rede: "RV", Placement: "PS" },
+  { B: "B9", Placement: "PS", Hora: "H09M13" },
+  { B: "B9", Placement: "PF", Hora: "H20M14" },
+  { B: "B3", Placement: "PF", Hora: "H19M0" },
+  { B: "B10", Source: "SI", Hora: "H06M8" },
+  { B: "B6", Hora: "H22M6", Seg_Metade: "Seg_00_30" },
+  { C: "C0", Hora: "H17M8", DiaSemana: "Quarta" },
+  { Tema: "D", RAM: "R2", Hora: "H01M6" },
+  { Tema: "D", V: "V0", Hora: "H11M1" },
+  { Tema: "D", Conexao: "M", Hora: "H10M13" },
+  { Tema: "D", Hora: "H10M6", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H19M10", DiaSemana: "Terça" },
+  { RAM: "R3", Conexao: "M", Hora: "H15M17" },
+  { Conexao: "M", Hora: "H16M7", Paridade: "Ímpar" },
+  { Placement: "PS", Hora: "H08M19", DiaSemana: "Domingo" },
+  { Placement: "PR", Hora: "H22M0", Paridade: "Ímpar" },
+  { Hora: "H08M18", DiaSemana: "Sexta", Paridade: "Par" },
+  { Hora: "H14M7", DiaSemana: "Quarta", Paridade: "Par" },
+  { Hora: "H12M3", DiaSemana: "Domingo", Min_Dezena: "Par" },
+  { Hora: "H06M11", DiaSemana: "Quarta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H23M18", DiaSemana: "Segunda", Seg_Metade: "Seg_00_30" },
+  { Hora: "H09M7", DiaSemana: "Segunda", Seg_Metade: "Seg_00_30" },
+  { Hora: "H09M7", DiaSemana: "Domingo", Seg_Metade: "Seg_31_60" },
+  { Rede: "RU", Placement: "PF", Hora: "H11M8" },
+  { B: "B9", Tema: "L", Hora: "H09M7" },
+  { B: "B_absent", Hora: "H21M13", DiaSemana: "Quarta" },
+  { C: "C0", Hora: "H21M14", DiaSemana: "Domingo" },
+  { Tema: "D", Placement: "PS", Hora: "H07M18" },
+  { RAM: "R2", Hora: "H14M10", DiaSemana: "Quarta" },
+  { V: "V0", Hora: "H17M15", DiaSemana: "Terça" },
+  { Placement: "PF", Hora: "H15M8", DiaSemana: "Quarta" },
+  { Hora: "H18M1", DiaSemana: "Terça", Paridade: "Par" },
+  { Hora: "H13M12", DiaSemana: "Segunda", Seg_Metade: "Seg_31_60" },
+  { N: "N6", Hora: "H22M14", Seg_Metade: "Seg_31_60" },
+  { N: "N6", Hora: "H22M10", Seg_Metade: "Seg_31_60" },
+  { C: "C0", Hora: "H00M10", Dia_Par: "Par" },
+  { RAM: "R3", Hora: "H07M2", Paridade: "Par" },
+  { N: "N6", B: "B10", RAM: "R3" },
+  { N: "N6", Tema: "D", Hora: "H20M17" },
+  { N: "N6", Placement: "PF", Hora: "H02M1" },
+  { N: "N6", Placement: "PS", Hora: "H10M4" },
+  { N: "N8", Placement: "PF", Hora: "H00M18" },
+  { N: "N6", Placement: "PF", Hora: "H23M10" },
+  { N: "N8", Hora: "H18M17", DiaSemana: "Sexta" },
+  { N: "N6", Hora: "H21M15", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H21M13", DiaSemana: "Terça" },
+  { N: "N6", Hora: "H08M3", DiaSemana: "Sábado" },
+  { N: "N6", Hora: "H14M7", Paridade: "Par" },
+  { N: "N6", Hora: "H13M11", Paridade: "Par" },
+  { N: "N6", Hora: "H16M15", Seg_Metade: "Seg_00_30" },
+  { N: "N6", Hora: "H10M2", Seg_Metade: "Seg_31_60" },
+  { B: "B4", Tema: "D", Hora: "H19M15" },
+  { B: "B7", RAM: "R2", Hora: "H18M11" },
+  { B: "B3", Movimento: "M0", Hora: "H12M12" },
+  { B: "B_absent", Rede: "RH", Hora: "H22M19" },
+  { B: "B3", Hora: "H21M8", DiaSemana: "Quarta" },
+  { B: "B3", Hora: "H21M7", Seg_Metade: "Seg_00_30" },
+  { C: "C0", Tema: "D", Hora: "H10M4" },
+  { C: "C0", Rede: "RU", Hora: "H18M11" },
+  { C: "C0", Hora: "H19M15", DiaSemana: "Sexta" },
+  { C: "C0", Hora: "H18M11", DiaSemana: "Sexta" },
+  { Tema: "L", Placement: "PR", Hora: "H20M10" },
+  { Tema: "D", Placement: "PF", Hora: "H18M18" },
+  { Tema: "D", Hora: "H10M9", DiaSemana: "Quinta" },
+  { Tema: "L", Hora: "H19M8", DiaSemana: "Terça" },
+  { Tema: "L", Hora: "H14M14", DiaSemana: "Domingo" },
+  { RAM: "R2", Placement: "PF", Hora: "H12M14" },
+  { RAM: "R2", Placement: "PR", Hora: "H20M15" },
+  { RAM: "R2", Hora: "H13M8", DiaSemana: "Domingo" },
+  { RAM: "R3", Hora: "H19M14", Seg_Metade: "Seg_00_30" },
+  { V: "V0", Hora: "H12M5", Paridade: "Par" },
+  { Conexao: "M", Hora: "H09M11", Paridade: "Par" },
+  { Movimento: "M0", Placement: "PU", Hora: "H21M13" },
+  { Movimento: "M0", Hora: "H09M13", DiaSemana: "Sexta" },
+  { Rede: "RC", Source: "SI", Hora: "H12M9" },
+  { Rede: "RU", Hora: "H16M3", DiaSemana: "Domingo" },
+  { Placement: "PR", Source: "SI", Hora: "H00M0" },
+  { Placement: "PF", Hora: "H21M7", DiaSemana: "Sexta" },
+  { Placement: "PF", Hora: "H07M18", DiaSemana: "Quinta" },
+  { Placement: "PS", Hora: "H21M19", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H05M14", DiaSemana: "Quarta" },
+  { Placement: "PS", Hora: "H10M19", DiaSemana: "Domingo" },
+  { Placement: "PF", Hora: "H20M13", Min_Dezena: "Ímpar" },
+  { Placement: "PF", Hora: "H23M16", Min_Dezena: "Ímpar" },
+  { Placement: "PU", Hora: "H13M9", Seg_Metade: "Seg_00_30" },
+  { Hora: "H10M16", DiaSemana: "Terça", Paridade: "Par" },
+  { Hora: "H20M17", DiaSemana: "Quinta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H11M2", DiaSemana: "Quarta", Seg_Metade: "Seg_31_60" },
+  { B: "B_absent", Placement: "PF", Hora: "H13M9" },
+  { B: "B_absent", Rede: "RH", Hora: "H15M17" },
+  { RAM: "R2", Hora: "H22M11", DiaSemana: "Terça" },
+  { Conexao: "W", Hora: "H13M9", DiaSemana: "Sexta" },
+  { Placement: "PF", Hora: "H22M6", DiaSemana: "Sexta" },
+  { Placement: "PF", Hora: "H07M13", Dia_Par: "Ímpar" },
+  { C: "C0", Hora: "H18M1", Dia_Par: "Ímpar" },
+  { N: "N6", Placement: "PS", Hora: "H19M16" },
+  { N: "N6", Placement: "PS", Hora: "H16M3" },
+  { N: "N6", Placement: "PF", Hora: "H20M8" },
+  { N: "N6", Hora: "H16M19", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H15M4", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H13M1", Dia_Par: "Ímpar" },
+  { N: "N6", Hora: "H10M10", Paridade: "Ímpar" },
+  { B: "B6", Conexao: "W", Hora: "H16M5" },
+  { B: "B8", Placement: "PF", Hora: "H21M1" },
+  { B: "B_absent", Hora: "H08M8", DiaSemana: "Quinta" },
+  { B: "B6", Hora: "H21M10", Dia_Par: "Par" },
+  { C: "C0", Placement: "PS", Hora: "H07M18" },
+  { Tema: "D", Placement: "PF", Hora: "H13M12" },
+  { Tema: "D", Placement: "PF", Hora: "H23M14" },
+  { Tema: "L", Hora: "H19M0", DiaSemana: "Domingo" },
+  { Tema: "L", Hora: "H18M10", DiaSemana: "Domingo" },
+  { Tema: "D", Hora: "H10M2", Paridade: "Ímpar" },
+  { RAM: "R3", Placement: "PR", Hora: "H19M18" },
+  { RAM: "R3", Hora: "H18M4", DiaSemana: "Quarta" },
+  { RAM: "R2", Hora: "H14M15", DiaSemana: "Segunda" },
+  { RAM: "R2", Hora: "H09M3", DiaSemana: "Sábado" },
+  { RAM: "R2", Hora: "H06M11", Seg_Metade: "Seg_31_60" },
+  { Placement: "PS", Hora: "H21M11", Paridade: "Par" },
+  { Placement: "PF", Hora: "H12M6", Paridade: "Ímpar" },
+  { Placement: "PS", Hora: "H18M10", Paridade: "Ímpar" },
+  { Hora: "H22M10", DiaSemana: "Sexta", Paridade: "Ímpar" },
+  { Hora: "H10M19", DiaSemana: "Quinta", Paridade: "Par" },
+  { Hora: "H22M15", DiaSemana: "Sexta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H14M16", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H09M4", DiaSemana: "Quinta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H19M1", DiaSemana: "Quarta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H20M13", DiaSemana: "Sábado", Seg_Metade: "Seg_00_30" },
+  { B: "B_absent", Tema: "D", Hora: "H10M5" },
+  { B: "B_absent", Placement: "PS", Hora: "H10M11" },
+  { Tema: "D", Placement: "PR", Hora: "H21M14" },
+  { Tema: "L", Hora: "H10M11", DiaSemana: "Sábado" },
+  { Tema: "D", Hora: "H18M18", Seg_Metade: "Seg_31_60" },
+  { V: "V0", Hora: "H16M1", Seg_Metade: "Seg_00_30" },
+  { Placement: "PO", Source: "SI", Dia_Par: "Ímpar" },
+  { Placement: "PF", Hora: "H10M19", DiaSemana: "Quinta" },
+  { Placement: "PF", Hora: "H14M15", Dia_Par: "Ímpar" },
+  { Placement: "PF", Hora: "H07M12", Paridade: "Par" },
+  { Source: "SI", Hora: "H06M8", Seg_Metade: "Seg_00_30" },
+  { N: "N6", Tema: "D", Hora: "H22M18" },
+  { N: "N6", Hora: "H21M19", Dia_Par: "Par" },
+  { N: "N6", Hora: "H16M7", Dia_Par: "Par" },
+  { Rede: "RH", Source: "SI", Hora: "H06M8" },
+  { Tema: "D", RAM: "R2", Hora: "H22M18" },
+  { N: "N6", Tema: "D", Hora: "H10M19" },
+  { N: "N8", Rede: "RU", Hora: "H11M12" },
+  { N: "N6", Placement: "PF", Hora: "H23M0" },
+  { N: "N6", Hora: "H20M6", Seg_Metade: "Seg_31_60" },
+  { B: "B6", Tema: "L", Hora: "H21M15" },
+  { B: "B_absent", Hora: "H19M19", DiaSemana: "Quarta" },
+  { B: "B5", Hora: "H22M5", Dia_Par: "Par" },
+  { C: "C0", Placement: "PF", Hora: "H16M8" },
+  { C: "C0", Hora: "H11M8", DiaSemana: "Segunda" },
+  { Tema: "D", Rede: "RC", Hora: "H11M0" },
+  { Tema: "D", Placement: "PF", Hora: "H11M15" },
+  { Tema: "D", Hora: "H17M0", DiaSemana: "Quarta" },
+  { Tema: "L", Hora: "H16M17", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H19M5", DiaSemana: "Terça" },
+  { Tema: "D", Hora: "H11M13", DiaSemana: "Sábado" },
+  { Tema: "L", Hora: "H06M16", Paridade: "Ímpar" },
+  { RAM: "R3", Conexao: "W", Hora: "H07M1" },
+  { RAM: "R2", Hora: "H11M12", DiaSemana: "Segunda" },
+  { RAM: "R2", Hora: "H07M15", DiaSemana: "Sábado" },
+  { RAM: "R2", Hora: "H08M0", Dia_Par: "Ímpar" },
+  { Conexao: "M", Source: "SI", Hora: "H18M7" },
+  { Conexao: "M", Hora: "H17M12", Seg_Metade: "Seg_31_60" },
+  { Rede: "RU", Placement: "PF", Hora: "H19M1" },
+  { Rede: "RU", Placement: "PF", Hora: "H06M18" },
+  { Rede: "RH", Hora: "H07M6", Dia_Par: "Ímpar" },
+  { Rede: "RU", Hora: "H06M7", Seg_Metade: "Seg_31_60" },
+  { Placement: "PS", Hora: "H22M3", DiaSemana: "Sexta" },
+  { Placement: "PF", Hora: "H11M1", DiaSemana: "Quinta" },
+  { Placement: "PS", Hora: "H00M5", Dia_Par: "Ímpar" },
+  { Placement: "PF", Hora: "H23M15", Paridade: "Par" },
+  { Placement: "PF", Hora: "H13M16", Paridade: "Ímpar" },
+  { Placement: "PR", Hora: "H15M6", Min_Dezena: "Par" },
+  { Placement: "PS", Hora: "H17M12", Seg_Metade: "Seg_31_60" },
+  { Hora: "H14M6", DiaSemana: "Segunda", Dia_Par: "Par" },
+  { Hora: "H09M2", DiaSemana: "Domingo", Dia_Par: "Par" },
+  { Hora: "H15M12", DiaSemana: "Quarta", Paridade: "Ímpar" },
+  { Hora: "H14M11", DiaSemana: "Quarta", Paridade: "Par" },
+  { Hora: "H12M14", DiaSemana: "Quinta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H10M11", DiaSemana: "Quarta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H13M1", DiaSemana: "Domingo", Seg_Metade: "Seg_00_30" },
+  { B: "B_absent", Tema: "L", Hora: "H22M14" },
+  { RAM: "R2", Hora: "H20M15", Paridade: "Par" },
+  { B: "B_absent", Placement: "PF", Hora: "H11M8" },
+  { Tema: "L", Placement: "PS", Hora: "H20M7" },
+  { Tema: "D", Hora: "H13M8", Seg_Metade: "Seg_31_60" },
+  { Placement: "PS", Hora: "H12M5", Paridade: "Par" },
+  { Placement: "PS", Hora: "H13M19", Seg_Metade: "Seg_31_60" },
+  { N: "N6", Hora: "H19M5", Seg_Metade: "Seg_31_60" },
+  { B: "B_absent", Hora: "H17M12", Seg_Metade: "Seg_31_60" },
+  { Tema: "D", Hora: "H09M11", Paridade: "Par" },
+  { RAM: "R3", Hora: "H19M17", DiaSemana: "Quarta" },
+  { RAM: "R2", Hora: "H09M16", Paridade: "Ímpar" },
+  { V: "V0", Hora: "H14M3", Paridade: "Ímpar" },
+  { Placement: "PF", Hora: "H06M18", Paridade: "Ímpar" },
+  { Placement: "PF", Hora: "H11M6", Min_Dezena: "Par" },
+  { Placement: "PF", Hora: "H13M17", Seg_Metade: "Seg_00_30" },
+  { RAM: "R2", Hora: "H14M4", Seg_Metade: "Seg_31_60" },
+  { N: "N8", Rede: "RU", Hora: "H21M3" },
+  { N: "N6", Hora: "H12M10", DiaSemana: "Quinta" },
+  { N: "N6", Hora: "H18M8", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H07M19", Seg_Metade: "Seg_00_30" },
+  { B: "B6", Tema: "D", Source: "SU" },
+  { B: "B7", Rede: "RV", Hora_Par: "Par" },
+  { B: "B_absent", Hora: "H11M4", DiaSemana: "Domingo" },
+  { C: "C1", Rede: "RH", Source: "SU" },
+  { C: "C0", Hora: "H22M3", DiaSemana: "Sexta" },
+  { C: "C0", Hora: "H10M9", DiaSemana: "Quarta" },
+  { C: "C0", Hora: "H00M3", Min_Dezena: "Par" },
+  { Tema: "L", Hora: "H09M11", DiaSemana: "Quinta" },
+  { Tema: "D", Hora: "H19M10", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H14M16", Paridade: "Ímpar" },
+  { Tema: "D", Hora: "H08M3", Seg_Metade: "Seg_00_30" },
+  { RAM: "R3", Hora: "H12M16", DiaSemana: "Sexta" },
+  { RAM: "R2", Hora: "H20M0", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H15M16", Min_Dezena: "Ímpar" },
+  { V: "V0", Hora: "H15M9", Seg_Metade: "Seg_31_60" },
+  { V: "V0", Hora: "H09M16", Seg_Metade: "Seg_00_30" },
+  { V: "V0", Hora: "H09M5", Seg_Metade: "Seg_31_60" },
+  { Rede: "RV", Placement: "PR", Periodo: "Manhã" },
+  { Rede: "RU", Hora: "H16M13", Seg_Metade: "Seg_31_60" },
+  { Placement: "PS", Hora: "H20M16", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H19M17", Paridade: "Ímpar" },
+  { Placement: "PR", Hora: "H22M13", Seg_Metade: "Seg_00_30" },
+  { Placement: "PR", Hora: "H21M10", Seg_Metade: "Seg_31_60" },
+  { Placement: "PR", Hora: "H19M18", Seg_Metade: "Seg_00_30" },
+  { Hora: "H22M1", DiaSemana: "Sexta", Paridade: "Ímpar" },
+  { Hora: "H22M9", DiaSemana: "Terça", Paridade: "Par" },
+  { Hora: "H18M9", DiaSemana: "Quinta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H23M5", DiaSemana: "Sábado", Seg_Metade: "Seg_31_60" },
+  { B: "B_absent", Hora: "H22M10", Dia_Par: "Ímpar" },
+  { C: "C0", Placement: "PF", Hora: "H16M9" },
+  { C: "C0", Hora: "H19M15", DiaSemana: "Terça" },
+  { Hora: "H10M7", DiaSemana: "Quarta", Seg_Metade: "Seg_00_30" },
+  { B: "B7", Conexao: "W", Rede: "RU" },
+  { B: "BL", Source: "SU", Periodo: "Noite" },
+  { Tema: "L", Hora: "H20M10", DiaSemana: "Quarta" },
+  { Tema: "D", Hora: "H10M0", Seg_Metade: "Seg_31_60" },
+  { RAM: "R3", Hora: "H17M4", Dia_Par: "Ímpar" },
+  { N: "N6", Tema: "D", Hora: "H08M4" },
+  { B: "B9", RAM: "R3", Hora: "H21M10" },
+  { B: "B_absent", RAM: "R3", Hora: "H11M15" },
+  { B: "B_absent", Hora: "H12M16", DiaSemana: "Quarta" },
+  { B: "B_absent", Hora: "H18M8", Dia_Par: "Par" },
+  { B: "B_absent", Hora: "H08M14", Seg_Metade: "Seg_31_60" },
+  { C: "C0", RAM: "R3", Hora: "H00M11" },
+  { Tema: "D", RAM: "R3", Hora: "H17M19" },
+  { Tema: "D", RAM: "R2", Hora: "H09M10" },
+  { Tema: "L", V: "V0", Hora: "H14M3" },
+  { Tema: "D", Placement: "PF", Hora: "H17M16" },
+  { Tema: "D", Placement: "PF", Hora: "H10M0" },
+  { Tema: "L", Hora: "H11M5", DiaSemana: "Quinta" },
+  { Tema: "L", Hora: "H22M7", DiaSemana: "Domingo" },
+  { Tema: "D", Hora: "H16M0", Paridade: "Ímpar" },
+  { Tema: "D", Hora: "H09M3", Min_Dezena: "Par" },
+  { Tema: "D", Hora: "H19M8", Seg_Metade: "Seg_00_30" },
+  { Tema: "D", Hora: "H17M3", Seg_Metade: "Seg_00_30" },
+  { RAM: "R2", Hora: "H23M10", DiaSemana: "Quarta" },
+  { RAM: "R2", Hora: "H23M7", DiaSemana: "Quarta" },
+  { RAM: "R2", Hora: "H07M17", Seg_Metade: "Seg_31_60" },
+  { Rede: "RU", Placement: "PS", Hora: "H18M11" },
+  { Rede: "RH", Placement: "PS", Hora: "H07M7" },
+  { Rede: "RU", Hora: "H09M4", Dia_Par: "Ímpar" },
+  { Placement: "PS", Hora: "H08M11", Dia_Par: "Par" },
+  { Placement: "PS", Hora: "H14M2", Paridade: "Ímpar" },
+  { Placement: "PF", Hora: "H13M17", Paridade: "Par" },
+  { RAM: "R3", Hora: "H20M4", Seg_Metade: "Seg_00_30" },
+  { RAM: "R3", Placement: "PF", Hora: "H13M18" },
+  { N: "N6", Tema: "D", Hora: "H21M4" },
+  { B: "B_absent", Rede: "RH", Hora: "H11M7" },
+  { Placement: "PS", Hora: "H15M1", Paridade: "Par" },
+  { N: "N6", Tema: "D", Hora: "H11M18" },
+  { N: "N6", Placement: "PF", Hora: "H19M13" },
+  { N: "N6", Placement: "PF", Hora: "H14M6" },
+  { N: "N6", Hora: "H12M12", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H17M10", Paridade: "Ímpar" },
+  { N: "N6", Hora: "H12M18", Seg_Metade: "Seg_00_30" },
+  { B: "B3", C: "C1", Placement: "PU" },
+  { B: "B2", Source: "SI", Hora: "H21M13" },
+  { B: "B2", Source: "SU", Periodo: "Tarde" },
+  { B: "B_absent", Hora: "H11M13", DiaSemana: "Quinta" },
+  { B: "B_absent", Hora: "H23M13", Seg_Metade: "Seg_00_30" },
+  { C: "C0", RAM: "R2", Hora: "H06M15" },
+  { C: "C0", Hora: "H21M17", DiaSemana: "Sexta" },
+  { C: "C0", Hora: "H22M13", DiaSemana: "Domingo" },
+  { Tema: "D", Placement: "PS", Hora: "H18M7" },
+  { Tema: "L", Placement: "PF", Hora: "H07M13" },
+  { Tema: "L", Hora: "H23M15", DiaSemana: "Terça" },
+  { Tema: "L", Hora: "H21M10", DiaSemana: "Segunda" },
+  { Tema: "L", Hora: "H12M1", DiaSemana: "Domingo" },
+  { RAM: "R2", Rede: "RH", Hora: "H07M0" },
+  { RAM: "R2", Placement: "PF", Hora: "H06M15" },
+  { RAM: "R3", Placement: "PF", Hora: "H17M0" },
+  { RAM: "R2", Hora: "H15M3", DiaSemana: "Sexta" },
+  { RAM: "R2", Hora: "H13M14", DiaSemana: "Quarta" },
+  { RAM: "R2", Hora: "H20M16", DiaSemana: "Terça" },
+  { RAM: "R3", Hora: "H11M4", DiaSemana: "Sábado" },
+  { RAM: "R2", Hora: "H12M5", DiaSemana: "Domingo" },
+  { RAM: "R3", Hora: "H02M1", Seg_Metade: "Seg_00_30" },
+  { Conexao: "W", Hora: "H14M17", DiaSemana: "Quarta" },
+  { Rede: "RU", Hora: "H21M3", DiaSemana: "Terça" },
+  { Placement: "PR", Hora: "H22M18", Paridade: "Par" },
+  { Hora: "H21M3", DiaSemana: "Segunda", Dia_Par: "Par" },
+  { Hora: "H20M15", DiaSemana: "Quarta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H09M8", DiaSemana: "Segunda", Seg_Metade: "Seg_00_30" },
+  { Tema: "L", Placement: "PR", Hora: "H02M1" },
+  { RAM: "R2", Rede: "RH", Hora: "H17M2" },
+  { Placement: "PS", Hora: "H15M17", Dia_Par: "Par" },
+  { Placement: "PS", Hora: "H10M6", Dia_Par: "Par" },
+  { Placement: "PF", Hora: "H10M17", Seg_Metade: "Seg_00_30" },
+  { Hora: "H22M10", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { T: "T1", N: "N6", Hora: "H01M18" },
+  { T: "T1", B: "B3", Hora: "H23M9" },
+  { T: "T1", B: "B5", Hora: "H17M10" },
+  { T: "T1", B: "B9", Hora: "H15M19" },
+  { T: "T1", B: "B5", Hora: "H15M4" },
+  { T: "T1", B: "B2", Hora: "H10M2" },
+  { T: "T1", B: "B4", Hora: "H09M6" },
+  { T: "T1", B: "B7", Hora: "H15M10" },
+  { T: "T1", B: "B2", Hora: "H18M17" },
+  { T: "T1", B: "B3", Hora: "H16M18" },
+  { T: "T1", C: "C1", Hora: "H17M16" },
+  { T: "T1", C: "C1", Hora: "H17M6" },
+  { T: "T1", C: "C1", Hora: "H14M12" },
+  { T: "T1", Tema: "L", Hora: "H04M9" },
+  { T: "T1", Tema: "L", Hora: "H03M17" },
+  { T: "T1", RAM: "R3", Hora: "H04M16" },
+  { T: "T1", RAM: "R2", Hora: "H03M19" },
+  { T: "T1", V: "V0", Hora: "H01M9" },
+  { T: "T1", Movimento: "M1", Hora: "H13M16" },
+  { T: "T1", Movimento: "M1", Hora: "H11M17" },
+  { T: "T1", Rede: "RC", Hora: "H17M1" },
+  { T: "T1", Rede: "RH", Hora: "H03M16" },
+  { T: "T1", Placement: "PU", Hora: "H19M3" },
+  { T: "T1", Placement: "PR", Hora: "H08M7" },
+  { T: "T1", Placement: "PF", Hora: "H05M3" },
+  { T: "T1", Placement: "PF", Hora: "H02M15" },
+  { T: "T1", Hora: "H07M8", DiaSemana: "Sexta" },
+  { T: "T1", Hora: "H06M10", DiaSemana: "Quinta" },
+  { T: "T1", Hora: "H04M15", DiaSemana: "Quarta" },
+  { T: "T1", Hora: "H14M0", DiaSemana: "Terça" },
+  { T: "T1", Hora: "H12M7", DiaSemana: "Segunda" },
+  { T: "T1", Hora: "H07M15", DiaSemana: "Domingo" },
+  { T: "T1", Hora: "H19M17", DiaSemana: "Sábado" },
+  { N: "N8", B: "B_absent", Hora: "H16M6" },
+  { N: "N8", B: "B_absent", Hora: "H06M3" },
+  { N: "N6", Tema: "L", Hora: "H19M19" },
+  { N: "N6", Tema: "D", Hora: "H02M5" },
+  { N: "N6", Movimento: "M0", Hora: "H05M15" },
+  { N: "N8", Rede: "RU", Hora: "H06M17" },
+  { N: "N6", Placement: "PS", Hora: "H23M8" },
+  { N: "N6", Placement: "PF", Hora: "H23M7" },
+  { N: "N6", Placement: "PF", Hora: "H13M1" },
+  { N: "N6", Placement: "PS", Hora: "H06M12" },
+  { N: "N8", Placement: "PR", Hora: "H17M11" },
+  { N: "N6", Placement: "PS", Hora: "H00M3" },
+  { N: "N8", Placement: "PS", Hora: "H01M15" },
+  { N: "N6", Source: "SI", Hora: "H02M6" },
+  { N: "N6", Hora: "H17M10", DiaSemana: "Sexta" },
+  { N: "N8", Hora: "H15M16", DiaSemana: "Quinta" },
+  { N: "N6", Hora: "H22M12", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H21M1", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H15M2", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H10M12", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H10M13", DiaSemana: "Terça" },
+  { N: "N6", Hora: "H13M14", DiaSemana: "Segunda" },
+  { N: "N8", Hora: "H07M16", DiaSemana: "Segunda" },
+  { N: "N8", Hora: "H06M16", DiaSemana: "Segunda" },
+  { N: "N6", Hora: "H21M18", DiaSemana: "Domingo" },
+  { N: "N8", Hora: "H00M7", DiaSemana: "Domingo" },
+  { N: "N6", Hora: "H18M2", Dia_Par: "Par" },
+  { N: "N6", Hora: "H07M9", Dia_Par: "Par" },
+  { N: "N6", Hora: "H00M17", Dia_Par: "Par" },
+  { N: "N6", Hora: "H17M10", Dia_Par: "Ímpar" },
+  { N: "N6", Hora: "H14M1", Paridade: "Par" },
+  { N: "N6", Hora: "H12M13", Min_Dezena: "Ímpar" },
+  { B: "B8", C: "C0", Hora: "H22M16" },
+  { B: "B9", C: "C0", Hora: "H22M12" },
+  { B: "B9", C: "C0", Hora: "H14M12" },
+  { B: "B8", C: "C0", Hora: "H09M4" },
+  { B: "B10", C: "C0", Hora: "H23M10" },
+  { B: "B10", C: "C0", Hora: "H21M1" },
+  { B: "B_absent", Tema: "L", Hora: "H23M14" },
+  { B: "BL", Tema: "D", Hora: "H21M1" },
+  { B: "B5", Tema: "L", Hora: "H19M9" },
+  { B: "B6", Tema: "L", Hora: "H19M5" },
+  { B: "B6", Tema: "D", Hora: "H18M19" },
+  { B: "B6", Tema: "D", Hora: "H15M14" },
+  { B: "B8", Tema: "L", Hora: "H12M13" },
+  { B: "B8", Tema: "D", Hora: "H21M11" },
+  { B: "B9", Tema: "L", Hora: "H08M3" },
+  { B: "B8", Tema: "L", Hora: "H22M13" },
+  { B: "B4", Tema: "D", Hora: "H22M5" },
+  { B: "B3", Tema: "D", Hora: "H20M11" },
+  { B: "B7", Tema: "L", Hora: "H19M6" },
+  { B: "B4", Tema: "D", Hora: "H13M15" },
+  { B: "B6", RAM: "R2", Hora: "H23M2" },
+  { B: "B7", RAM: "R3", Hora: "H22M15" },
+  { B: "B4", RAM: "R2", Hora: "H21M15" },
+  { B: "B7", RAM: "R3", Hora: "H19M3" },
+  { B: "B8", RAM: "R3", Hora: "H12M8" },
+  { B: "B4", RAM: "R3", Hora: "H11M15" },
+  { B: "B9", RAM: "R2", Hora: "H10M10" },
+  { B: "B9", RAM: "R2", Hora: "H07M16" },
+  { B: "B10", RAM: "R3", Hora: "H00M6" },
+  { B: "B5", RAM: "R3", Hora: "H00M6" },
+  { B: "B5", RAM: "R3", Hora: "H15M1" },
+  { B: "B7", RAM: "R2", Hora: "H12M19" },
+  { B: "B9", RAM: "R3", Hora: "H10M16" },
+  { B: "B9", RAM: "R2", Hora: "H09M19" },
+  { B: "B_absent", RAM: "R3", Hora: "H01M5" },
+  { B: "B_absent", RAM: "R3", Hora: "H23M11" },
+  { B: "B8", RAM: "R2", Hora: "H22M7" },
+  { B: "B8", RAM: "R2", Hora: "H21M15" },
+  { B: "B6", RAM: "R3", Hora: "H17M18" },
+  { B: "B9", RAM: "R2", Hora: "H11M3" },
+  { B: "B3", Conexao: "W", Hora: "H21M13" },
+  { B: "B7", Conexao: "W", Hora: "H21M12" },
+  { B: "B9", Conexao: "W", Hora: "H20M1" },
+  { B: "B10", Conexao: "W", Hora: "H17M16" },
+  { B: "B5", Conexao: "W", Hora: "H12M12" },
+  { B: "B8", Conexao: "W", Hora: "H12M3" },
+  { B: "B10", Conexao: "W", Hora: "H09M7" },
+  { B: "B9", Conexao: "W", Hora: "H08M5" },
+  { B: "BL", Conexao: "W", Hora: "H21M5" },
+  { B: "B7", Conexao: "W", Hora: "H21M2" },
+  { B: "B_absent", Conexao: "M", Hora: "H12M17" },
+  { B: "B9", Conexao: "W", Hora: "H07M11" },
+  { B: "B10", Movimento: "M0", Hora: "H11M18" },
+  { B: "B5", Rede: "RH", Hora: "H17M14" },
+  { B: "B3", Rede: "RH", Hora: "H17M9" },
+  { B: "B5", Rede: "RH", Hora: "H14M5" },
+  { B: "B6", Rede: "RU", Hora: "H14M2" },
+  { B: "B7", Rede: "RH", Hora: "H09M8" },
+  { B: "B4", Rede: "RH", Hora: "H18M13" },
+  { B: "B7", Rede: "RH", Hora: "H12M0" },
+  { B: "B8", Rede: "RH", Hora: "H09M13" },
+  { B: "B7", Rede: "RH", Hora: "H15M18" },
+  { B: "B10", Rede: "RV", Dia_Par: "Ímpar" },
+  { B: "B2", Placement: "PS", Hora: "H18M15" },
+  { B: "B5", Placement: "PF", Hora: "H15M13" },
+  { B: "B_absent", Placement: "PR", Hora: "H13M5" },
+  { B: "B4", Placement: "PF", Hora: "H13M2" },
+  { B: "B_absent", Placement: "PR", Hora: "H12M7" },
+  { B: "B_absent", Placement: "PS", Hora: "H06M6" },
+  { B: "B4", Placement: "PS", Hora: "H23M2" },
+  { B: "B6", Placement: "PF", Hora: "H20M10" },
+  { B: "B_absent", Placement: "PS", Hora: "H00M18" },
+  { B: "B7", Placement: "PF", Hora: "H23M9" },
+  { B: "B8", Placement: "PF", Hora: "H21M14" },
+  { B: "B2", Placement: "PS", Hora: "H21M11" },
+  { B: "B3", Placement: "PF", Hora: "H20M4" },
+  { B: "B7", Source: "SI", Hora: "H21M13" },
+  { B: "B5", Source: "SI", Hora: "H21M10" },
+  { B: "B7", Source: "SI", Hora: "H20M9" },
+  { B: "B4", Source: "SI", Hora: "H17M6" },
+  { B: "B7", Source: "SI", Hora: "H16M4" },
+  { B: "B6", Source: "SI", Hora: "H14M1" },
+  { B: "B5", Source: "SI", Hora: "H18M9" },
+  { B: "B10", Source: "SI", Hora: "H17M5" },
+  { B: "B_absent", Hora: "H21M0", DiaSemana: "Quinta" },
+  { B: "B_absent", Hora: "H19M17", DiaSemana: "Quinta" },
+  { B: "B_absent", Hora: "H15M13", DiaSemana: "Quinta" },
+  { B: "B_absent", Hora: "H11M10", DiaSemana: "Quarta" },
+  { B: "B4", Hora: "H22M8", DiaSemana: "Terça" },
+  { B: "B8", Hora: "H20M19", DiaSemana: "Terça" },
+  { B: "B_absent", Hora: "H22M13", DiaSemana: "Segunda" },
+  { B: "B_absent", Hora: "H09M9", DiaSemana: "Segunda" },
+  { B: "B_absent", Hora: "H13M4", DiaSemana: "Domingo" },
+  { B: "B4", Hora: "H23M12", DiaSemana: "Sábado" },
+  { B: "B_absent", Hora: "H12M17", DiaSemana: "Sábado" },
+  { B: "B7", Hora: "H22M7", Dia_Par: "Par" },
+  { B: "B5", Hora: "H21M12", Dia_Par: "Par" },
+  { B: "BL", Hora: "H21M4", Dia_Par: "Par" },
+  { B: "B7", Hora: "H20M2", Dia_Par: "Par" },
+  { B: "B7", Hora: "H16M2", Dia_Par: "Par" },
+  { B: "B3", Hora: "H15M4", Dia_Par: "Par" },
+  { B: "B8", Hora: "H13M13", Dia_Par: "Par" },
+  { B: "B7", Hora: "H10M18", Dia_Par: "Par" },
+  { B: "B7", Hora: "H09M2", Dia_Par: "Par" },
+  { B: "B4", Hora: "H22M4", Dia_Par: "Ímpar" },
+  { B: "B5", Hora: "H20M18", Dia_Par: "Ímpar" },
+  { B: "B7", Hora: "H20M5", Dia_Par: "Ímpar" },
+  { B: "B9", Hora: "H19M6", Dia_Par: "Ímpar" },
+  { B: "B8", Hora: "H12M18", Dia_Par: "Ímpar" },
+  { B: "B6", Hora: "H12M12", Dia_Par: "Ímpar" },
+  { B: "B9", Hora: "H09M5", Dia_Par: "Ímpar" },
+  { B: "B9", Hora: "H11M13", Paridade: "Ímpar" },
+  { B: "B9", Hora: "H11M0", Paridade: "Ímpar" },
+  { B: "B9", Hora: "H09M14", Paridade: "Ímpar" },
+  { B: "B5", Hora: "H10M3", Paridade: "Ímpar" },
+  { B: "B8", Hora: "H23M3", Seg_Metade: "Seg_31_60" },
+  { B: "B8", Hora: "H22M12", Seg_Metade: "Seg_31_60" },
+  { B: "B10", Hora: "H22M9", Seg_Metade: "Seg_00_30" },
+  { B: "B2", Hora: "H18M8", Seg_Metade: "Seg_31_60" },
+  { B: "B6", Hora: "H15M13", Seg_Metade: "Seg_00_30" },
+  { B: "B5", Hora: "H09M1", Seg_Metade: "Seg_00_30" },
+  { B: "B9", Hora: "H07M19", Seg_Metade: "Seg_31_60" },
+  { B: "B3", Hora: "H22M12", Seg_Metade: "Seg_00_30" },
+  { B: "B3", Hora: "H20M17", Seg_Metade: "Seg_31_60" },
+  { B: "B9", Hora: "H23M5", Seg_Metade: "Seg_31_60" },
+  { B: "B4", Hora: "H21M9", Seg_Metade: "Seg_31_60" },
+  { B: "B8", Hora: "H17M14", Seg_Metade: "Seg_00_30" },
+  { B: "B3", Hora: "H15M13", Seg_Metade: "Seg_00_30" },
+  { B: "B7", Hora: "H14M19", Seg_Metade: "Seg_00_30" },
+  { C: "C0", Tema: "L", Hora: "H01M16" },
+  { C: "C1", RAM: "R3", Hora: "H15M14" },
+  { C: "C0", RAM: "R2", Hora: "H09M12" },
+  { C: "C0", Conexao: "W", Hora: "H02M13" },
+  { C: "C0", Movimento: "M1", Hora: "H11M8" },
+  { C: "C0", Rede: "RC", Hora: "H18M3" },
+  { C: "C1", Rede: "RH", Hora: "H14M5" },
+  { C: "C0", Placement: "PR", Hora: "H07M17" },
+  { C: "C0", Hora: "H13M6", DiaSemana: "Quinta" },
+  { C: "C0", Hora: "H00M6", DiaSemana: "Terça" },
+  { C: "C0", Hora: "H16M6", DiaSemana: "Segunda" },
+  { C: "C0", Hora: "H12M10", DiaSemana: "Segunda" },
+  { C: "C0", Hora: "H08M6", DiaSemana: "Domingo" },
+  { C: "C0", Hora: "H01M7", Dia_Par: "Par" },
+  { C: "C1", Hora: "H00M12", Dia_Par: "Ímpar" },
+  { Tema: "L", V: "V0", Hora: "H01M8" },
+  { Tema: "D", Conexao: "M", Hora: "H18M12" },
+  { Tema: "D", Rede: "RU", Hora: "H06M9" },
+  { Tema: "L", Rede: "RC", Hora: "H17M13" },
+  { Tema: "D", Placement: "PS", Hora: "H15M5" },
+  { Tema: "L", Placement: "PR", Hora: "H17M14" },
+  { Tema: "L", Placement: "PR", Hora: "H15M19" },
+  { Tema: "L", Source: "SU", Hora: "H22M5" },
+  { Tema: "L", Hora: "H15M19", DiaSemana: "Sexta" },
+  { Tema: "L", Hora: "H14M15", DiaSemana: "Quinta" },
+  { Tema: "D", Hora: "H14M13", DiaSemana: "Quinta" },
+  { Tema: "D", Hora: "H23M0", DiaSemana: "Terça" },
+  { Tema: "D", Hora: "H12M10", DiaSemana: "Terça" },
+  { Tema: "D", Hora: "H14M10", DiaSemana: "Segunda" },
+  { Tema: "L", Hora: "H23M18", DiaSemana: "Domingo" },
+  { Tema: "D", Hora: "H19M7", DiaSemana: "Domingo" },
+  { Tema: "L", Hora: "H10M1", DiaSemana: "Domingo" },
+  { Tema: "L", Hora: "H20M3", DiaSemana: "Sábado" },
+  { Tema: "L", Hora: "H17M11", DiaSemana: "Sábado" },
+  { Tema: "D", Hora: "H07M10", DiaSemana: "Sábado" },
+  { Tema: "L", Hora: "H23M12", DiaSemana: "Domingo" },
+  { Tema: "D", Hora: "H05M5", Dia_Par: "Par" },
+  { Tema: "D", Hora: "H01M4", Dia_Par: "Ímpar" },
+  { Tema: "L", Hora: "H00M15", Paridade: "Par" },
+  { RAM: "R2", Rede: "RH", Hora: "H14M17" },
+  { RAM: "R3", Rede: "RC", Hora: "H07M8" },
+  { RAM: "R3", Rede: "RU", Hora: "H11M11" },
+  { RAM: "R3", Rede: "RC", Hora: "H13M12" },
+  { RAM: "R2", Placement: "PF", Hora: "H06M14" },
+  { RAM: "R3", Placement: "PR", Hora: "H09M5" },
+  { RAM: "R2", Hora: "H20M11", DiaSemana: "Sexta" },
+  { RAM: "R3", Hora: "H18M19", DiaSemana: "Quinta" },
+  { RAM: "R2", Hora: "H17M0", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H06M19", DiaSemana: "Quinta" },
+  { RAM: "R3", Hora: "H09M19", DiaSemana: "Quarta" },
+  { RAM: "R3", Hora: "H08M3", DiaSemana: "Quarta" },
+  { RAM: "R2", Hora: "H08M1", DiaSemana: "Terça" },
+  { RAM: "R2", Hora: "H07M15", DiaSemana: "Terça" },
+  { RAM: "R3", Hora: "H17M17", DiaSemana: "Segunda" },
+  { RAM: "R3", Hora: "H16M4", DiaSemana: "Domingo" },
+  { V: "V0", Hora: "H20M0", Dia_Par: "Ímpar" },
+  { V: "V0", Hora: "H21M2", Seg_Metade: "Seg_00_30" },
+  { Conexao: "M", Movimento: "M0", Hora: "H21M16" },
+  { Conexao: "W", Rede: "RC", Hora: "H13M14" },
+  { Conexao: "M", Rede: "RU", Hora: "H14M17" },
+  { Conexao: "W", Placement: "PU", Hora: "H15M17" },
+  { Conexao: "W", Placement: "PF", Hora: "H01M14" },
+  { Conexao: "M", Source: "SI", Hora: "H14M19" },
+  { Conexao: "W", Hora: "H14M14", DiaSemana: "Quinta" },
+  { Conexao: "W", Hora: "H09M3", DiaSemana: "Quinta" },
+  { Conexao: "U", Hora: "H08M17", DiaSemana: "Quarta" },
+  { Conexao: "U", Hora: "H18M5", DiaSemana: "Terça" },
+  { Conexao: "W", Hora: "H01M9", Dia_Par: "Par" },
+  { Movimento: "M0", Placement: "PR", Hora: "H12M12" },
+  { Movimento: "M0", Placement: "PR", Hora: "H01M2" },
+  { Movimento: "M1", Placement: "PF", Hora: "H20M12" },
+  { Rede: "RU", Placement: "PF", Hora: "H18M17" },
+  { Rede: "RU", Placement: "PF", Hora: "H16M10" },
+  { Rede: "RU", Placement: "PF", Hora: "H18M7" },
+  { Rede: "RU", Placement: "PF", Hora: "H22M15" },
+  { Rede: "RH", Hora: "H09M3", DiaSemana: "Sexta" },
+  { Rede: "RU", Hora: "H20M11", DiaSemana: "Quinta" },
+  { Rede: "RU", Hora: "H18M19", DiaSemana: "Quarta" },
+  { Rede: "RU", Hora: "H12M10", DiaSemana: "Quarta" },
+  { Rede: "RH", Hora: "H10M0", DiaSemana: "Quarta" },
+  { Rede: "RU", Hora: "H08M2", DiaSemana: "Quarta" },
+  { Rede: "RU", Hora: "H16M16", DiaSemana: "Segunda" },
+  { Rede: "RU", Hora: "H22M2", DiaSemana: "Domingo" },
+  { Placement: "PU", Hora: "H22M9", DiaSemana: "Sexta" },
+  { Placement: "PS", Hora: "H15M11", DiaSemana: "Sexta" },
+  { Placement: "PF", Hora: "H20M1", DiaSemana: "Quinta" },
+  { Placement: "PF", Hora: "H14M5", DiaSemana: "Quinta" },
+  { Placement: "PS", Hora: "H15M15", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H12M4", DiaSemana: "Quarta" },
+  { Placement: "PS", Hora: "H07M14", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H11M2", DiaSemana: "Terça" },
+  { Placement: "PF", Hora: "H20M17", Dia_Par: "Ímpar" },
+  { Placement: "PF", Hora: "H14M12", Dia_Par: "Ímpar" },
+  { Placement: "PR", Hora: "H15M15", Paridade: "Ímpar" },
+  { Placement: "PU", Hora: "H09M7", Paridade: "Ímpar" },
+  { Placement: "PF", Hora: "H18M3", Min_Dezena: "Par" },
+  { Placement: "PS", Hora: "H09M13", Min_Dezena: "Ímpar" },
+  { Placement: "PR", Hora: "H16M15", Seg_Metade: "Seg_31_60" },
+  { Source: "SI", Hora: "H07M1", DiaSemana: "Sexta" },
+  { Source: "SI", Hora: "H16M12", DiaSemana: "Sábado" },
+  { Source: "SI", Hora: "H03M15", Paridade: "Ímpar" },
+  { Hora: "H11M16", DiaSemana: "Domingo", Dia_Par: "Ímpar" },
+  { Hora: "H13M2", DiaSemana: "Terça", Dia_Par: "Par" },
+  { Hora: "H22M0", DiaSemana: "Segunda", Dia_Par: "Ímpar" },
+  { Hora: "H13M4", DiaSemana: "Segunda", Dia_Par: "Ímpar" },
+  { Hora: "H10M15", DiaSemana: "Sábado", Dia_Par: "Ímpar" },
+  { Hora: "H08M12", DiaSemana: "Quinta", Paridade: "Ímpar" },
+  { Hora: "H19M11", DiaSemana: "Terça", Paridade: "Par" },
+  { Hora: "H10M13", DiaSemana: "Segunda", Paridade: "Par" },
+  { Hora: "H18M6", DiaSemana: "Terça", Min_Dezena: "Par" },
+  { Hora: "H12M4", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H11M11", DiaSemana: "Sexta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H07M18", DiaSemana: "Sexta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H23M0", DiaSemana: "Quinta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H10M16", DiaSemana: "Segunda", Seg_Metade: "Seg_31_60" },
+  { Hora: "H18M2", DiaSemana: "Domingo", Seg_Metade: "Seg_00_30" },
+  { Hora: "H15M9", DiaSemana: "Sábado", Seg_Metade: "Seg_00_30" },
+  { Hora: "H06M17", DiaSemana: "Sábado", Seg_Metade: "Seg_00_30" },
+  { Hora: "H04M3", Periodo: "Noite", Hora_Par: "Par" },
+  { B: "B_absent", Hora: "H11M1", Seg_Metade: "Seg_31_60" },
+  { RAM: "R3", Placement: "PF", Hora: "H22M1" },
+  { Tema: "D", Placement: "PS", Hora: "H20M6" },
+  { V: "V0", Hora: "H18M3", Dia_Par: "Ímpar" },
+  { Rede: "RU", Hora: "H13M14", Dia_Par: "Par" },
+  { B: "B_absent", Hora: "H21M3", DiaSemana: "Terça" },
+  { B: "B_absent", Hora: "H17M7", DiaSemana: "Terça" },
+  { Tema: "D", Rede: "RU", Hora: "H19M3" },
+  { Tema: "L", Hora: "H21M11", DiaSemana: "Domingo" },
+  { Tema: "D", Hora: "H10M6", Paridade: "Ímpar" },
+  { RAM: "R3", Hora: "H17M19", DiaSemana: "Quarta" },
+  { RAM: "R3", Hora: "H13M13", Min_Dezena: "Ímpar" },
+  { Placement: "PF", Hora: "H22M5", DiaSemana: "Domingo" },
+  { Placement: "PF", Hora: "H07M6", Min_Dezena: "Ímpar" },
+  { Hora: "H21M2", DiaSemana: "Terça", Seg_Metade: "Seg_00_30" },
+  { B: "B_absent", RAM: "R3", Hora: "H22M5" },
+  { B: "B_absent", Hora: "H13M11", Paridade: "Par" },
+  { Tema: "D", Rede: "RU", Hora: "H11M12" },
+  { Tema: "L", Hora: "H20M7", Paridade: "Par" },
+  { RAM: "R2", Hora: "H18M14", DiaSemana: "Terça" },
+  { Rede: "RH", Placement: "PF", Hora: "H13M2" },
+  { Placement: "PS", Hora: "H20M17", Dia_Par: "Par" },
+  { T: "T1", B: "B9", Hora: "H20M17" },
+  { T: "T1", B: "B4", Hora: "H17M11" },
+  { T: "T1", B: "B2", Hora: "H16M16" },
+  { T: "T1", B: "B6", Hora: "H14M0" },
+  { T: "T1", B: "B6", Hora: "H10M7" },
+  { T: "T1", Hora: "H15M19", DiaSemana: "Quinta" },
+  { T: "T1", Hora: "H07M2", DiaSemana: "Terça" },
+  { T: "T1", Hora: "H09M14", DiaSemana: "Sábado" },
+  { T: "T1", Hora: "H00M7", DiaSemana: "Sábado" },
+  { N: "N8", Placement: "PU", Hora: "H19M12" },
+  { N: "N6", Placement: "PS", Hora: "H16M5" },
+  { N: "N6", Placement: "PS", Hora: "H11M18" },
+  { N: "N6", Hora: "H22M11", DiaSemana: "Sexta" },
+  { N: "N6", Hora: "H11M13", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H09M12", DiaSemana: "Quarta" },
+  { N: "N8", Hora: "H13M7", DiaSemana: "Segunda" },
+  { N: "N6", Hora: "H21M0", DiaSemana: "Domingo" },
+  { N: "N8", Hora: "H17M9", DiaSemana: "Sábado" },
+  { N: "N6", Hora: "H23M6", Min_Dezena: "Par" },
+  { N: "N6", Hora: "H23M18", Seg_Metade: "Seg_31_60" },
+  { B: "B7", C: "C0", Hora: "H22M8" },
+  { B: "B3", Tema: "L", Hora: "H22M3" },
+  { B: "B10", Tema: "L", Hora: "H07M19" },
+  { B: "B10", Tema: "L", Hora: "H11M11" },
+  { B: "B7", Tema: "D", Hora: "H21M5" },
+  { B: "B10", RAM: "R1", Placement: "PF" },
+  { B: "B3", RAM: "R3", Hora: "H21M0" },
+  { B: "B6", Conexao: "W", Hora: "H10M1" },
+  { B: "B6", Conexao: "M", Hora: "H09M19" },
+  { B: "B7", Conexao: "W", Hora: "H08M19" },
+  { B: "B3", Conexao: "W", Hora: "H18M17" },
+  { B: "B10", Movimento: "M0", Hora: "H08M5" },
+  { B: "B7", Movimento: "M0", Hora: "H18M0" },
+  { B: "B3", Rede: "RH", Hora: "H21M10" },
+  { B: "B9", Rede: "RH", Hora: "H12M14" },
+  { B: "B5", Placement: "PS", Hora: "H23M6" },
+  { B: "B_absent", Placement: "PR", Hora: "H19M15" },
+  { B: "B7", Placement: "PF", Hora: "H13M5" },
+  { B: "B8", Placement: "PS", Hora: "H10M10" },
+  { B: "B_absent", Hora: "H14M19", DiaSemana: "Sexta" },
+  { B: "B_absent", Hora: "H20M14", DiaSemana: "Quinta" },
+  { B: "B8", Hora: "H18M8", DiaSemana: "Quinta" },
+  { B: "B_absent", Hora: "H12M19", DiaSemana: "Quinta" },
+  { B: "B_absent", Hora: "H11M6", DiaSemana: "Sábado" },
+  { B: "B2", Hora: "H22M8", Dia_Par: "Ímpar" },
+  { B: "B2", Hora: "H22M15", Paridade: "Ímpar" },
+  { B: "B8", Hora: "H18M5", Paridade: "Ímpar" },
+  { B: "B9", Hora: "H17M6", Paridade: "Par" },
+  { B: "B9", Hora: "H19M3", Min_Dezena: "Ímpar" },
+  { B: "B9", Hora: "H20M19", Seg_Metade: "Seg_31_60" },
+  { B: "B8", Hora: "H10M13", Seg_Metade: "Seg_00_30" },
+  { B: "B6", Hora: "H21M8", Seg_Metade: "Seg_31_60" },
+  { B: "B8", Hora: "H20M16", Seg_Metade: "Seg_31_60" },
+  { B: "B7", Hora: "H09M14", Seg_Metade: "Seg_00_30" },
+  { C: "C0", Hora: "H18M16", DiaSemana: "Quarta" },
+  { C: "C0", Hora: "H22M4", DiaSemana: "Sábado" },
+  { C: "C0", Hora: "H06M18", Seg_Metade: "Seg_00_30" },
+  { Tema: "D", V: "V0", Hora: "H18M4" },
+  { Tema: "L", V: "V0", Hora: "H18M15" },
+  { Tema: "L", Hora: "H17M14", DiaSemana: "Sexta" },
+  { Tema: "D", Hora: "H14M1", DiaSemana: "Sexta" },
+  { Tema: "D", Hora: "H13M17", DiaSemana: "Sexta" },
+  { Tema: "D", Hora: "H20M12", DiaSemana: "Quinta" },
+  { Tema: "L", Hora: "H19M16", DiaSemana: "Quinta" },
+  { Tema: "D", Hora: "H12M10", Paridade: "Ímpar" },
+  { RAM: "R2", Conexao: "M", Hora: "H08M19" },
+  { RAM: "R2", Placement: "PR", Hora: "H22M19" },
+  { RAM: "R3", Placement: "PR", Hora: "H20M0" },
+  { RAM: "R3", Hora: "H13M17", DiaSemana: "Sexta" },
+  { RAM: "R3", Hora: "H02M2", DiaSemana: "Sexta" },
+  { RAM: "R2", Hora: "H21M16", DiaSemana: "Sábado" },
+  { RAM: "R2", Hora: "H20M10", Dia_Par: "Ímpar" },
+  { V: "V0", Hora: "H10M12", Dia_Par: "Par" },
+  { V: "V1", Hora: "H04M19", Seg_Metade: "Seg_00_30" },
+  { Conexao: "W", Rede: "RC", Hora: "H13M10" },
+  { Conexao: "M", Source: "SI", Hora: "H17M18" },
+  { Conexao: "W", Hora: "H12M19", DiaSemana: "Sexta" },
+  { Conexao: "W", Hora: "H15M13", DiaSemana: "Terça" },
+  { Conexao: "W", Hora: "H00M16", Paridade: "Ímpar" },
+  { Rede: "RU", Hora: "H22M0", DiaSemana: "Sábado" },
+  { Placement: "PS", Hora: "H16M4", DiaSemana: "Sexta" },
+  { Placement: "PS", Hora: "H20M6", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H18M10", DiaSemana: "Quarta" },
+  { Placement: "PS", Hora: "H21M0", DiaSemana: "Terça" },
+  { Placement: "PS", Hora: "H17M5", DiaSemana: "Segunda" },
+  { Placement: "PS", Hora: "H23M1", DiaSemana: "Domingo" },
+  { Placement: "PF", Hora: "H11M19", DiaSemana: "Domingo" },
+  { Placement: "PS", Hora: "H23M10", DiaSemana: "Sábado" },
+  { Placement: "PR", Hora: "H17M5", Dia_Par: "Par" },
+  { Placement: "PS", Hora: "H16M10", Dia_Par: "Ímpar" },
+  { Source: "SI", Hora: "H12M18", DiaSemana: "Sexta" },
+  { Source: "SI", Hora: "H12M16", DiaSemana: "Terça" },
+  { Source: "SI", Hora: "H21M12", DiaSemana: "Segunda" },
+  { Hora: "H11M17", DiaSemana: "Quarta", Paridade: "Ímpar" },
+  { Hora: "H14M12", DiaSemana: "Segunda", Paridade: "Ímpar" },
+  { Hora: "H12M8", DiaSemana: "Domingo", Paridade: "Ímpar" },
+  { Hora: "H21M12", DiaSemana: "Quarta", Seg_Metade: "Seg_31_60" },
+  { Hora: "H23M9", DiaSemana: "Terça", Seg_Metade: "Seg_31_60" },
+  { Hora: "H18M12", DiaSemana: "Domingo", Seg_Metade: "Seg_00_30" },
+  { B: "B_absent", Hora: "H22M5", DiaSemana: "Terça" },
+  { B: "B_absent", Tema: "L", Hora: "H08M7" },
+  { B: "B5", Hora: "H20M18", Paridade: "Par" },
+  { Tema: "D", Hora: "H21M17", DiaSemana: "Quarta" },
+  { Rede: "RU", Placement: "PS", Hora: "H17M6" },
+  { Rede: "RU", Hora: "H17M6", DiaSemana: "Quarta" },
+  { Rede: "RH", Hora: "H10M10", DiaSemana: "Quarta" },
+  { Hora: "H15M15", DiaSemana: "Quarta", Seg_Metade: "Seg_31_60" },
+  { RAM: "R2", Hora: "H17M11", DiaSemana: "Quarta" },
+  { T: "T1", Conexao: "U", Hora: "H03M11" },
+  { N: "N6", Tema: "D", Hora: "H16M11" },
+  { N: "N6", Tema: "D", Hora: "H12M7" },
+  { N: "N6", Hora: "H09M12", DiaSemana: "Sexta" },
+  { N: "N6", Hora: "H22M13", DiaSemana: "Quarta" },
+  { B: "B4", RAM: "R3", Hora: "H18M8" },
+  { B: "B9", RAM: "R2", Hora: "H21M6" },
+  { B: "B_absent", RAM: "R3", Hora: "H11M11" },
+  { B: "B_absent", RAM: "R3", Hora: "H23M9" },
+  { B: "B_absent", Rede: "RH", Hora: "H16M11" },
+  { B: "B8", Rede: "RH", Hora: "H12M7" },
+  { B: "B6", Placement: "PS", Hora: "H21M2" },
+  { B: "B4", Source: "SI", Hora: "H22M0" },
+  { B: "B_absent", Hora: "H22M5", DiaSemana: "Domingo" },
+  { B: "B_absent", Hora: "H09M15", DiaSemana: "Domingo" },
+  { B: "B7", Hora: "H20M19", Dia_Par: "Par" },
+  { B: "B3", Hora: "H22M11", Seg_Metade: "Seg_00_30" },
+  { C: "C0", Hora: "H19M7", DiaSemana: "Sexta" },
+  { C: "C0", Hora: "H20M3", DiaSemana: "Quinta" },
+  { C: "C0", Hora: "H08M2", DiaSemana: "Quinta" },
+  { C: "C0", Hora: "H11M2", DiaSemana: "Segunda" },
+  { Tema: "D", Hora: "H22M8", DiaSemana: "Quinta" },
+  { Tema: "D", Hora: "H11M10", DiaSemana: "Sábado" },
+  { Tema: "D", Hora: "H11M2", DiaSemana: "Sábado" },
+  { V: "V0", Hora: "H14M13", Min_Dezena: "Ímpar" },
+  { V: "V0", Hora: "H20M3", Min_Dezena: "Par" },
+  { Rede: "RU", Placement: "PR", Hora: "H21M8" },
+  { Rede: "RU", Hora: "H12M8", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H19M9", DiaSemana: "Quinta" },
+  { Placement: "PF", Hora: "H11M3", DiaSemana: "Sábado" },
+  { Hora: "H23M13", DiaSemana: "Sexta", Paridade: "Ímpar" },
+  { Hora: "H11M7", DiaSemana: "Quinta", Seg_Metade: "Seg_00_30" },
+  { Hora: "H20M19", DiaSemana: "Quarta", Seg_Metade: "Seg_31_60" },
+  { Placement: "PF", Hora: "H12M18", Dia_Par: "Par" },
+  { N: "N6", Placement: "PS", Hora: "H18M8" },
+  { C: "C0", RAM: "R2", Hora: "H17M13" },
+  { Rede: "RU", Hora: "H22M1", Seg_Metade: "Seg_31_60" },
+  { Tema: "D", Hora: "H18M7", Paridade: "Ímpar" },
+  { B: "B_absent", Hora: "H18M8", Seg_Metade: "Seg_31_60" },
+  { RAM: "R3", Hora: "H18M0", Paridade: "Ímpar" },
+  { Placement: "PF", Hora: "H18M14", Seg_Metade: "Seg_00_30" },
+  { N: "N6", Placement: "PS", Hora: "H15M0" },
+  { N: "N6", Hora: "H20M9", DiaSemana: "Quarta" },
+  { N: "N6", Hora: "H18M8", Paridade: "Par" },
+  { N: "N6", Hora: "H10M16", Seg_Metade: "Seg_31_60" },
+  { B: "B9", Movimento: "M0", Hora: "H20M8" },
+  { B: "B7", Rede: "RH", Hora: "H11M10" },
+  { B: "B4", Source: "SI", Hora: "H21M0" },
+  { B: "B_absent", Hora: "H12M17", DiaSemana: "Quarta" },
+  { B: "B_absent", Hora: "H17M9", DiaSemana: "Terça" },
+  { B: "B_absent", Hora: "H20M8", DiaSemana: "Segunda" },
+  { C: "C0", Hora: "H09M19", DiaSemana: "Quinta" },
+  { Tema: "D", Placement: "PF", Hora: "H18M12" },
+  { Tema: "D", Hora: "H22M9", DiaSemana: "Quarta" },
+  { RAM: "R2", Placement: "PF", Hora: "H20M14" },
+  { RAM: "R2", Hora: "H23M10", DiaSemana: "Domingo" },
+  { RAM: "R3", Hora: "H15M19", Dia_Par: "Ímpar" },
+  { Rede: "RH", Hora: "H08M19", DiaSemana: "Sexta" },
+  { Rede: "RU", Hora: "H21M18", DiaSemana: "Quarta" },
+  { Placement: "PR", Hora: "H19M9", Dia_Par: "Par" },
+  { Hora: "H23M7", DiaSemana: "Segunda", Paridade: "Par" },
+  { Hora: "H11M16", DiaSemana: "Quarta", Min_Dezena: "Ímpar" },
+  { B: "B_absent", Hora: "H18M7", DiaSemana: "Quinta" },
+  { B: "B_absent", Placement: "PS", Hora: "H10M15" },
+  { RAM: "R2", Placement: "PF", Hora: "H12M11" },
+  { N: "N6", Hora: "H22M12", Paridade: "Ímpar" },
+  { Tema: "L", Placement: "PF", Hora: "H19M0" },
+  { N: "N6", Placement: "PF", Hora: "H21M11" },
+  { N: "N6", Hora: "H22M6", DiaSemana: "Terça" },
+  { B: "BL", Tema: "L", Hora: "H22M2" },
+  { B: "B6", Placement: "PS", Hora: "H12M11" },
+  { RAM: "R2", Hora: "H11M10", DiaSemana: "Domingo" },
+  { Rede: "RH", Hora: "H13M15", DiaSemana: "Sexta" },
+  { Placement: "PS", Hora: "H11M4", DiaSemana: "Quarta" },
+  { Placement: "PF", Hora: "H23M5", DiaSemana: "Domingo" },
+  { Placement: "PS", Hora: "H16M15", Paridade: "Par" },
+  { RAM: "R2", Hora: "H21M14", Seg_Metade: "Seg_00_30" },
+  { N: "N6", Placement: "PF", Hora: "H21M7" },
+  { N: "N6", Hora: "H12M6", DiaSemana: "Quinta" },
+  { N: "N6", Hora: "H11M10", Paridade: "Par" },
+  { B: "B_absent", Rede: "RH", Hora: "H11M19" },
+  { Placement: "PF", Hora: "H20M18", Dia_Par: "Ímpar" },
+  { B: "B_absent", RAM: "R1", DiaSemana: "Terça" },
+  { N: "N6", Hora: "H21M9", DiaSemana: "Terça" },
+  { N: "N6", Hora: "H17M18", Paridade: "Ímpar" },
+  { B: "B5", RAM: "R2", Hora: "H21M9" },
+  { B: "B_absent", Placement: "PF", Hora: "H21M7" },
+  { B: "B_absent", Hora: "H23M11", DiaSemana: "Sábado" },
+  { C: "C0", Hora: "H12M4", DiaSemana: "Quinta" },
+  { Rede: "RU", Hora: "H16M2", DiaSemana: "Quarta" },
+  { Placement: "PS", Hora: "H11M19", DiaSemana: "Quarta" },
+  { Source: "SI", Hora: "H08M18", Seg_Metade: "Seg_31_60" },
+  { Placement: "PF", Hora: "H21M9", DiaSemana: "Terça" },
+  { B: "B_absent", Placement: "PF", Hora: "H11M4" },
+  { Tema: "L", Hora: "H18M14", Seg_Metade: "Seg_00_30" },
+  { V: "V0", Hora: "H17M14", Paridade: "Par" },
+  { Placement: "PS", Hora: "H12M15", Paridade: "Par" },
+  { Hora: "H10M15", DiaSemana: "Quarta", Paridade: "Par" },
+  { N: "N6", Placement: "PF", Hora: "H20M19" },
+  { Tema: "D", V: "V0", Hora: "H15M7" },
+  { B: "B_absent", Rede: "RH", Hora: "H22M8" },
+  { V: "V0", Hora: "H12M1", Seg_Metade: "Seg_00_30" },
+  { N: "N6", Tema: "D", Hora: "H22M3" },
+  { N: "N6", Hora: "H21M9", Seg_Metade: "Seg_00_30" },
+  { B: "B_absent", Hora: "H22M0", DiaSemana: "Quarta" },
+  { Hora: "H22M2", DiaSemana: "Terça", Seg_Metade: "Seg_31_60" },
+  { Hora: "H21M6", DiaSemana: "Quarta", Min_Dezena: "Par" },
+  { B: "B10", DiaSemana: "Quarta", Seg_Metade: "Seg_00_30" },
+  { N: "N6", Hora: "H22M4", DiaSemana: "Quarta" },
+
+
+
+]
+const REGRAS_TOP05 = []
+const REGRAS_TOP06 = []
+
+const matchTop = (regras) => regras.some(regra =>
+  Object.entries(regra).every(([p,v]) => RUNTIME[p] === v)
+)
+const bateuTop02 = matchTop(REGRAS_TOP02)
+const bateuTop03 = matchTop(REGRAS_TOP03)
+const bateuTop04 = matchTop(REGRAS_TOP04)
+const bateuTop05 = matchTop(REGRAS_TOP05)
+const bateuTop06 = matchTop(REGRAS_TOP06)
+
+if(bateuTop02) enviarEvento("TOP02")
+if(bateuTop03) enviarEvento("TOP03")
+if(bateuTop04) enviarEvento("TOP04")
+if(bateuTop05) enviarEvento("TOP05")
+if(bateuTop06) enviarEvento("TOP06")
+
+const topTag = bateuTop06?"F6":bateuTop05?"F5":bateuTop04?"F4":bateuTop03?"F3":bateuTop02?"F2":""
+
+// =========================================================
+// MONTAGEM DO UC FINAL (sem tempoTag e vib)
+// =========================================================
+const idTag = "ID" + userId  // 10 chars fixos
+
+// ATENÇÃO: tempoTag e vib foram removidos do array abaixo
+const corpoParts = [
+  baseUC,
+  // tempoTag,              // REMOVIDO
+  velTag,
+  batObj.bateria,
+  batObj.carregando,
+  tema,
+  ram,
+  // vib,                   // REMOVIDO
+  device,
+  conexao,
+  movimento,
+  redeTag,
+  placementTag,
+  sourceTag,
+  stateTag,
+  cityTag
+]
+
+const corpo       = corpoParts.join("").replace(/[^a-zA-Z0-9]/g, "")
+const MAX         = 50
+const espacoCorpo = MAX - idTag.length - topTag.length
+const corpoFinal  = corpo.slice(0, espacoCorpo)
+const finalUC     = corpoFinal + topTag + idTag
+
+// =========================================================
+// DEBUG
+// =========================================================
+if(DEBUG){
+  alert(
+    "=== DEBUG UC v3 ===\n" +
+    "stateTag:   [" + stateTag      + "] (" + geo.state_full + ")\n" +
+    "cityTag:    [" + cityTag       + "] (" + geo.city_full  + ")\n" +
+    "placement:  [" + placementTag  + "]\n" +
+    "source:     [" + sourceTag     + "]\n" +
+    "horaTag:    [" + horaTag       + "]\n" +
+    "topTag:     [" + topTag        + "]\n" +
+    "corpo len:  [" + corpo.length  + "]\n" +
+    "finalUC:    [" + finalUC       + "] (" + finalUC.length + " chars)\n" +
+    "userId:     [" + userId        + "]"
+  )
+}
+
+// =========================================================
+// GOOGLE SHEETS — fire-and-forget
+// =========================================================
+try {
+  const agora     = new Date()
+  const data_hora = agora.toLocaleString("pt-BR",{timeZone:"America/Sao_Paulo"})
+  const payload   = {
+    data_hora,
+    external_id : userId,
+    fbc         : getCookie("_fbc") || params.get("fbclid") || "",
+    fbp         : getCookie("_fbp") || "",
+    placement   : placementTag,
+    source      : sourceTag,
+    device,
+    conexao,
+    rede        : redeTag,
+    velocidade  : velTag,
+    state       : stateTag,
+    state_full  : geo.state_full,
+    city        : cityTag,
+    city_full   : geo.city_full,
+    uc_completo : finalUC,
+    min_dezena  : minDezena,
+    min_unidade : minUnidade,
+    seg_metade  : segMetade,
+    hora_par    : horaPar,
+    dia_semana  : diaSemana,
+    dia_par     : diaPar,
+    periodo,
+    b_par       : bPar,
+    n_par       : nPar,
+    fbp_flag    : FBP,
+    fbc_flag    : FBC
+  }
+  if(ENABLE_PARIDADE && paridadeTag) payload.paridade = paridadeTag
+  fetch(SHEETS_URL, {
+    method  : "POST",
+    mode    : "no-cors",
+    headers : { "Content-Type": "application/json" },
+    body    : JSON.stringify(payload)
+  }).catch(()=>{})
+} catch(e){}
+
+// =========================================================
+// REDIRECT
+// =========================================================
+const url = `https://shopee-utm-tracker.onrender.com/?link=${encodeURIComponent(LINK)}&uc=${finalUC}`
+setTimeout(() => { window.location.href = url }, 400)
+
+})();
+</script>
+</body>
+</html>
